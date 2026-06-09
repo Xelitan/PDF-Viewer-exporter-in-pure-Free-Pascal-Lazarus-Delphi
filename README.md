@@ -103,3 +103,31 @@ Doc.AddText(PageIndex, 'Test Here', Left, Top, FontRes);
 ```    
 Doc.ExtractTextToFile(PageIndex, 'output.txt');
 ```
+
+
+## PDF Features supported
+
+Stream filters:
+- FlateDecode
+- LZWDecode
+- ASCIIHexDecode
+- ASCII85Decode
+- RunLengthDecode
+
+Images:
+- JPEG / DCTDecode: baseline and progressive, with grayscale, RGB, CMYK and Adobe YCCK source spaces. CMYK→RGB is done Adobe-aware.
+- Raw/Flate/LZW raster images in DeviceRGB, DeviceGray, DeviceCMYK, CalRGB, CalGray, and Indexed (palette) color.
+- ICCBased images (RGB, CMYK, Gray).
+- Soft-mask transparency
+
+Embedded font formats:
+- TrueType — FontFile2
+- CFF / Type1C / CIDFontType0C / OpenType — FontFile3
+
+## PDF Features NOT supported
+
+Images:
+- CCITT Group 3/4 fax images (monochrome)
+- JBIG2 images (monochrome)
+- JPEG 2000 / JPXDecode
+- Lab color-space images
