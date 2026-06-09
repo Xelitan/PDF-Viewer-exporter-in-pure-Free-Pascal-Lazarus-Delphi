@@ -18,6 +18,7 @@ begin
   PDF := TXelPDF.Create(Form1);
   Pdf.Parent := Form1;
   Pdf.Align := alClient;
+  Pdf.AutoFit := afWidth; //fit to width of the component
   Pdf.LoadFromFile('test.pdf');
 end;
 
