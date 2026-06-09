@@ -76,3 +76,30 @@ Doc.RenderPageToPng(PageNumber, 'out.png');
 F := TFileStream.Create('another.pdf', fmOpenRead);
 Doc.ImportPDF(F, 0, 0, 0);
 ```
+
+## Insert a blank page or remove a page:
+
+```
+Doc.RemovePage(PageIndex);
+Doc.AddPage(Width, Height);
+```
+
+## Load or save document to file or stream
+```
+Doc.SaveToStream(Str: TStream);
+Doc.SaveToFile('output.pdf');
+```
+## Insert a JPEG image into a PDF:
+```
+Doc.AddJpegImage(PageIndex, JpegBytes, Left, Top, Width, Height);
+```
+## Insert some text into a PDF:
+```                           
+FontRes := Doc.AddFont(FontName, FontSize);
+Doc.AddText(PageIndex, 'Test Here', Left, Top, FontRes);
+```
+
+## Extract text to a file
+```    
+Doc.ExtractTextToFile(PageIndex, 'output.txt');
+```
