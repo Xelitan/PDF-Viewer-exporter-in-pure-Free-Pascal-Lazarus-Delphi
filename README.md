@@ -1,3 +1,7 @@
+# License
+
+GNU/GPL. Commercial licenses available, starting at $100 (single developer, up to 5 programs).
+
 # Usage examples
 
 ## Just showing a PDF:
@@ -31,7 +35,7 @@ Pdf.Document.SaveToFile('txt.pdf');
 ```
 
 ## Exporting an embedded font:
-``
+```
 TotalFonts := PDF.Document.CountFonts; //count fonts in the PDF
 PDF.Document.ExportFont(5, 'out.otf'); //5 is the number of the font
 ```
@@ -47,4 +51,28 @@ Other images:
 //images that are embedded in other formats in the PDF- conversion to PNG
 Total := Doc.ImagesCount(PageNumber);
 Doc.ExportImage(PageNumber, ImageNumber, 'out.png');
+```
+
+## Exporting vector images to SVG
+```
+Total := Doc.VectorGroupsCount(PageNumber);
+Doc.ExportVectorGroup(PageNumber, ImageNumber, 'out.svg');
+```
+
+## Drawing a rectangle:
+
+```
+Doc.DrawRect(0, 50, 600, 200, 80, clRed); //PageNum, Left, Top, Width, Height, Color
+```
+
+## Rendering to image
+```
+Doc.RenderPageToPng(PageNumber, 'out.png');
+```
+
+## Insert another PDF between pages of current PDF
+
+```
+F := TFileStream.Create('another.pdf', fmOpenRead);
+Doc.ImportPDF(F, 0, 0, 0);
 ```
