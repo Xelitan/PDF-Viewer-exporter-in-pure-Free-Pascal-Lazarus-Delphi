@@ -103,7 +103,12 @@ Doc.AddText(PageIndex, 'Test Here', Left, Top, FontRes);
 ```    
 Doc.ExtractTextToFile(PageIndex, 'output.txt');
 ```
+## Supports encrypted PDFs
 
+Supports:
+- RC4-40 (R2), RC4-128 (R3)
+- AES-128 (V4/R4, AESV2)
+- AES-256 (V5/R6, AESV3)
 
 ## PDF Features supported
 
