@@ -6,6 +6,8 @@ GNU/GPL. Commercial licenses available, starting at $100 (single developer, up t
 
 ## Just showing a PDF:
 ```
+uses ... PdfParser, PdfBitmapRenderer, XelPDF;
+...
 type
   TForm1 = class(TForm)
 ...
