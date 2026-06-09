@@ -383,9 +383,10 @@ begin
   end
   else
   begin
-    // A TrueType whose only cmap is Mac (platform 1) loads but renders NOTHING via
-    // GDI's Unicode TextOut (e.g. LibreOffice's BAAAAA+LiberationSerif subset). Refuse
-    // it so the caller substitutes a real Windows face instead of drawing blank text.
+    // The parser (BuildFontMap) already injects a Windows (3,1) cmap into embedded
+    // TrueType subsets that lack one (composing the PDF's code->Unicode with the
+    // font's code->GID). If a Windows cmap is still missing here, GDI's Unicode
+    // TextOut would draw nothing, so refuse and let the caller substitute.
     if not HasWindowsCmap(Data) then Exit;
     LoadData := Data;
   end;
@@ -644,18 +645,22 @@ begin
   begin
     // Horizontal width-fit: scale the glyph run toward the PDF's own advance width
     // (Bounds.X2-X1). SQUEEZING (sx<1) is always allowed — substitute faces are
-    // often wider than the original. STRETCHING (sx>1) is only allowed when the
-    // text matrix is genuinely anamorphic (wider than tall, e.g. cover headlines
-    // A=66 D=59). For normal text the extra advance width comes from word/char
-    // spacing in JUSTIFIED lines; stretching glyphs to fill that would distort
-    // them horribly (the space belongs between words, not inside letters).
+    // often wider than the original. STRETCHING (sx>1) is allowed for anamorphic
+    // matrices (cover headlines A=66 D=59) AND for single-word runs (no space char):
+    // there the extra advance is real glyph advance, so fitting it exactly aligns
+    // the run with fixed-position artwork — e.g. the cover "JetCopy", whose black
+    // drop shadow is baked into the cover image and was wider than the live yellow
+    // text. Stretching is suppressed only for MULTI-word, non-anamorphic lines,
+    // where the surplus width is word/char spacing in JUSTIFIED text and stretching
+    // glyphs to fill it would distort them (the space belongs between words).
     IntendedW := Round((E.Bounds.X2 - E.Bounds.X1) * FOptions.Scale);
     NaturalW  := Bitmap.Canvas.TextWidth(string(S));
     if (NaturalW > 0) and (IntendedW > 0) then
     begin
       sx := IntendedW / NaturalW;
-      if (sx > 1.0) and (MatrixScaleX(E.Matrix) <= MatrixScaleY(E.Matrix) * 1.03) then
-        sx := 1.0;  // not anamorphic -> don't stretch (justification spacing)
+      if (sx > 1.0) and (Pos(' ', string(S)) > 0) and
+         (MatrixScaleX(E.Matrix) <= MatrixScaleY(E.Matrix) * 1.03) then
+        sx := 1.0;  // justified multi-word, not anamorphic -> don't stretch
       if ((sx < 0.97) or (sx > 1.03)) and (sx > 0.1) and (sx < 5.0) then
       begin
         SetGraphicsMode(DC, GM_ADVANCED);

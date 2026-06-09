@@ -26,6 +26,14 @@ function WrapCFFToOTF(const CFF: TPdfBytes; const FamilyName: AnsiString): TPdfB
 // Add a minimal cmap and/or post table to a TrueType/OpenType font that lacks
 // them (common in PDF-embedded subsets) so Windows can open/install it.
 function EnsureFontTables(const Font: TPdfBytes): TPdfBytes;
+// Ensure a TrueType font has a Windows (3,1) Unicode cmap so GDI's Unicode TextOut
+// renders the embedded glyphs. If the font already has a (3,x) cmap it is returned
+// unchanged. Otherwise a (3,1) cmap is synthesized from the font's OWN cmap
+// (code->GID), mapping each code to Unicode via CodeToUni[code] (the PDF font's
+// code->Unicode, e.g. from /ToUnicode) — falling back to Mac-Roman/identity when an
+// entry is 0. Pass an empty array to use only the font's own (Mac) cmap. Returns the
+// original font if no usable source cmap exists (caller then substitutes).
+function EnsureWindowsCmap(const Font: TPdfBytes; const CodeToUni: array of Word): TPdfBytes;
 
 implementation
 
@@ -946,6 +954,177 @@ begin
   finally
     out_.Free;
   end;
+end;
+
+// Mac Roman high range 0x80..0xFF -> Unicode (for converting a (1,0) cmap's codes).
+const MacRomanHi: array[0..127] of Word = (
+  $00C4,$00C5,$00C7,$00C9,$00D1,$00D6,$00DC,$00E1,$00E0,$00E2,$00E4,$00E3,$00E5,$00E7,$00E9,$00E8,
+  $00EA,$00EB,$00ED,$00EC,$00EE,$00EF,$00F1,$00F3,$00F2,$00F4,$00F6,$00F5,$00FA,$00F9,$00FB,$00FC,
+  $2020,$00B0,$00A2,$00A3,$00A7,$2022,$00B6,$00DF,$00AE,$00A9,$2122,$00B4,$00A8,$2260,$00C6,$00D8,
+  $221E,$00B1,$2264,$2265,$00A5,$00B5,$2202,$2211,$220F,$03C0,$222B,$00AA,$00BA,$03A9,$00E6,$00F8,
+  $00BF,$00A1,$00AC,$221A,$0192,$2248,$2206,$00AB,$00BB,$2026,$00A0,$00C0,$00C3,$00D5,$0152,$0153,
+  $2013,$2014,$201C,$201D,$2018,$2019,$00F7,$25CA,$00FF,$0178,$2044,$20AC,$2039,$203A,$FB01,$FB02,
+  $2021,$00B7,$201A,$201E,$2030,$00C2,$00CA,$00C1,$00CB,$00C8,$00CD,$00CE,$00CF,$00CC,$00D3,$00D4,
+  $F8FF,$00D2,$00DA,$00DB,$00D9,$0131,$02C6,$02DC,$00AF,$02D8,$02D9,$02DA,$00B8,$02DD,$02DB,$02C7);
+
+function EnsureWindowsCmap(const Font: TPdfBytes; const CodeToUni: array of Word): TPdfBytes;
+type TPair = record U, G: Word; end;
+var
+  n, i, off, len: Integer;
+  tag: AnsiString;
+  Tags: array of AnsiString; Datas: array of TBytes;
+  cmapIdx, nsub, s, plat, subOff, bestOff, bestPlat, fmt: Integer;
+  cm, sub, newCmap: TBytes;
+  pairs: array of TPair; np: Integer;
+  segCount, k, j, sr, es, rs, c, fc, ec, idd, ro, glyOff, g: Integer;
+  tp: TPair;
+  ms: TMemoryStream;
+
+  // Map a font code (in the source cmap's space) + its GID to a (Unicode, GID) pair.
+  // The PDF's code->Unicode (CodeToUni) is authoritative; the font's own cmap only
+  // supplies code->GID. Fall back to Mac-Roman/identity when CodeToUni has no entry.
+  procedure AddPair(code, gid: Integer);
+  var u: Integer;
+  begin
+    if (gid <= 0) or (gid > $FFFF) or (np > High(pairs)) then Exit;
+    u := 0;
+    if (code >= 0) and (code <= High(CodeToUni)) then u := CodeToUni[code];
+    if u = 0 then
+    begin
+      if bestPlat = 1 then
+      begin
+        if code < $80 then u := code
+        else if code <= $FF then u := MacRomanHi[code - $80]
+        else u := code;
+      end
+      else u := code;                     // (0,x): codes are already Unicode
+    end;
+    if (u = 0) or (u = $FFFF) then Exit;
+    pairs[np].U := Word(u); pairs[np].G := Word(gid); Inc(np);
+  end;
+
+begin
+  Result := Font;
+  if Length(Font) < 12 then Exit;
+  n := RdU16(Font, 4);
+  if (n <= 0) or (12 + n*16 > Length(Font)) then Exit;
+
+  // Collect all tables; remember the cmap.
+  cmapIdx := -1; SetLength(Tags, 0); SetLength(Datas, 0);
+  for i := 0 to n-1 do
+  begin
+    tag := AnsiChar(Font[12+i*16]) + AnsiChar(Font[12+i*16+1]) +
+           AnsiChar(Font[12+i*16+2]) + AnsiChar(Font[12+i*16+3]);
+    off := Integer(RdU32(Font, 12+i*16+8));
+    len := Integer(RdU32(Font, 12+i*16+12));
+    if (off < 0) or (len < 0) or (off+len > Length(Font)) then Continue;
+    SetLength(sub, len); if len > 0 then Move(Font[off], sub[0], len);
+    SetLength(Tags, Length(Tags)+1); Tags[High(Tags)] := tag;
+    SetLength(Datas, Length(Datas)+1); Datas[High(Datas)] := sub;
+    if tag = 'cmap' then cmapIdx := High(Tags);
+  end;
+  if cmapIdx < 0 then Exit;
+  cm := Datas[cmapIdx];
+  if Length(cm) < 4 then Exit;
+
+  // Already has a Windows (3,x) cmap? Then GDI can render it as-is; leave unchanged.
+  nsub := RdU16(cm, 2);
+  for s := 0 to nsub-1 do
+  begin
+    if 4+s*8+8 > Length(cm) then Break;
+    if RdU16(cm, 4+s*8) = 3 then Exit;    // Result already = Font
+  end;
+
+  // Pick a source subtable: prefer Mac (1,x); otherwise the first.
+  bestOff := -1; bestPlat := -1;
+  for s := 0 to nsub-1 do
+  begin
+    if 4+s*8+8 > Length(cm) then Break;
+    plat := RdU16(cm, 4+s*8); subOff := Integer(RdU32(cm, 4+s*8+4));
+    if (subOff < 0) or (subOff+4 > Length(cm)) then Continue;
+    if bestOff < 0 then begin bestOff := subOff; bestPlat := plat; end;
+    if plat = 1 then begin bestOff := subOff; bestPlat := 1; end;
+  end;
+  if bestOff < 0 then Exit;
+
+  fmt := RdU16(cm, bestOff);
+  np := 0; SetLength(pairs, 70000);       // pre-sized (no SetLength inside AddPair)
+  case fmt of
+    0:
+      if bestOff+6+256 <= Length(cm) then
+        for c := 0 to 255 do AddPair(c, cm[bestOff+6+c]);
+    6:
+      begin
+        fc := RdU16(cm, bestOff+6); k := RdU16(cm, bestOff+8);
+        for c := 0 to k-1 do
+          if bestOff+10+c*2+2 <= Length(cm) then AddPair(fc+c, RdU16(cm, bestOff+10+c*2));
+      end;
+    4:
+      begin
+        segCount := RdU16(cm, bestOff+6) div 2;
+        for k := 0 to segCount-1 do
+        begin
+          ec  := RdU16(cm, bestOff+14 + k*2);
+          fc  := RdU16(cm, bestOff+16 + segCount*2 + k*2);
+          idd := SmallInt(RdU16(cm, bestOff+16 + segCount*4 + k*2));
+          ro  := RdU16(cm, bestOff+16 + segCount*6 + k*2);
+          if (fc = $FFFF) and (ec = $FFFF) then Continue;
+          for c := fc to ec do
+          begin
+            if ro = 0 then g := (c + idd) and $FFFF
+            else
+            begin
+              glyOff := (bestOff+16 + segCount*6 + k*2) + ro + (c - fc)*2;
+              if glyOff+2 > Length(cm) then Continue;
+              g := RdU16(cm, glyOff);
+              if g <> 0 then g := (g + idd) and $FFFF;
+            end;
+            AddPair(c, g);
+          end;
+        end;
+      end;
+  else
+    Exit;                                  // unsupported source format -> substitute
+  end;
+  if np = 0 then Exit;
+
+  // Sort by Unicode ascending (insertion sort) and drop duplicate code points.
+  for k := 1 to np-1 do
+  begin
+    tp := pairs[k]; j := k-1;
+    while (j >= 0) and (pairs[j].U > tp.U) do begin pairs[j+1] := pairs[j]; Dec(j); end;
+    pairs[j+1] := tp;
+  end;
+  j := 0;
+  for k := 0 to np-1 do
+    if (j = 0) or (pairs[k].U <> pairs[j-1].U) then begin pairs[j] := pairs[k]; Inc(j); end;
+  np := j;
+
+  // Build a (3,1) format-4 cmap: one segment per char + the 0xFFFF terminator.
+  segCount := np + 1;
+  es := 0; k := 1; while k*2 <= segCount do begin k := k*2; Inc(es); end;
+  sr := k*2; rs := segCount*2 - sr;
+  ms := TMemoryStream.Create;
+  try
+    W16(ms, 0); W16(ms, 1);                // cmap version, numTables
+    W16(ms, 3); W16(ms, 1); W32(ms, 12);   // (3,1), subtable offset 12
+    W16(ms, 4);                            // format 4
+    W16(ms, 16 + 8*segCount);              // length
+    W16(ms, 0);                            // language
+    W16(ms, segCount*2);                   // segCountX2
+    W16(ms, sr); W16(ms, es); W16(ms, rs);
+    for k := 0 to np-1 do W16(ms, pairs[k].U);  W16(ms, $FFFF);  // endCode + terminator
+    W16(ms, 0);                                                  // reservedPad
+    for k := 0 to np-1 do W16(ms, pairs[k].U);  W16(ms, $FFFF);  // startCode + terminator
+    for k := 0 to np-1 do W16(ms, Word((Integer(pairs[k].G) - Integer(pairs[k].U)) and $FFFF));
+    W16(ms, 1);                                                  // idDelta terminator
+    for k := 0 to np do W16(ms, 0);                              // idRangeOffset (all 0)
+    newCmap := StreamBytes(ms);
+  finally ms.Free; end;
+
+  Datas[cmapIdx] := newCmap;
+  newCmap := AssembleSFNT(Tags, Datas, $00010000);
+  if Length(newCmap) > 0 then Result := newCmap;   // else leave Result = Font
 end;
 
 function EnsureFontTables(const Font: TPdfBytes): TPdfBytes;

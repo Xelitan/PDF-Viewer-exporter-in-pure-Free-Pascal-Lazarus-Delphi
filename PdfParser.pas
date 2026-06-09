@@ -1670,6 +1670,8 @@ var FontsObj, FontObj, TUObj, WidthsObj, DescObj, FFObj, DescFontsObj: TPdfObjec
     Font: TPdfFont;
     CMap: TPdfCMap;
     FF3Sub: string;
+    CodeToUni: array[0..255] of Word;
+    cc: Integer; us: UnicodeString; bs: AnsiString; ttData: TPdfBytes;
 begin
   Result := TFPHashObjectList.Create(True);
   if not Assigned(Resources) then Exit;
@@ -1704,7 +1706,23 @@ begin
       begin
         FFObj := ResolveObject(TPdfDictionaryObject(DescObj).Get('FontFile2'));
         if FFObj is TPdfStreamObject then
-          Font.SetFontProgramBytes(fpkTrueType, TPdfStreamObject(FFObj).DecodedData)
+        begin
+          // An embedded TrueType subset may carry only a Mac/private cmap keyed by
+          // the PDF's own content codes (not Unicode), so GDI's Unicode TextOut would
+          // draw nothing. Compose the PDF code->Unicode (DecodeSimpleByte, from the
+          // font's /ToUnicode+/Encoding) with the font's code->GID cmap into a proper
+          // Windows (3,1) cmap so the real embedded glyphs render. No-op if the font
+          // already has a (3,x) cmap.
+          SetLength(bs, 1);
+          for cc := 0 to 255 do
+          begin
+            bs[1] := AnsiChar(cc);
+            us := Font.DecodeString(bs);   // simple fonts decode one byte -> one char
+            if Length(us) > 0 then CodeToUni[cc] := Word(us[1]) else CodeToUni[cc] := 0;
+          end;
+          ttData := EnsureWindowsCmap(TPdfStreamObject(FFObj).DecodedData, CodeToUni);
+          Font.SetFontProgramBytes(fpkTrueType, ttData);
+        end
         else
         begin
           FFObj := ResolveObject(TPdfDictionaryObject(DescObj).Get('FontFile3'));
