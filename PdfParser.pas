@@ -350,6 +350,9 @@ type
     procedure BuildFontList;
     procedure CollectFontsFrom(Res: TPdfObject; Seen: TList);
     function  DecodeRasterToRGB(E: TPdfImageElement; out RGB: TPdfBytes): Boolean;
+    // CCITTFaxDecode: if the image stream uses it, decode the fax bits to 8-bit
+    // DeviceGray so the normal raster pipeline can render/export the image.
+    procedure ApplyCcittDecode(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
   public
     constructor Create;
     overload;
@@ -402,7 +405,7 @@ type
 
 implementation
 
-uses PdfCFF, PdfBitmapRenderer, PdfJpeg, FPImage, FPWriteJPEG;  // added-API helpers
+uses PdfCFF, PdfBitmapRenderer, PdfJpeg, PdfCcitt, FPImage, FPWriteJPEG;  // added-API helpers
 
 function IsWhite(C: Byte): Boolean;
 begin
@@ -1578,6 +1581,99 @@ begin
       end;
     end;
   end;
+end;
+
+// CCITTFaxDecode is an image-only filter that DecodeStream passes through raw
+// (like DCTDecode). When an image XObject uses it, decode the fax bits here and
+// turn the element into a plain 8-bit DeviceGray raster — the renderer's
+// DrawRawDeviceGray and the ExportImage/DecodeRasterToRGB paths then handle it
+// with no further special-casing.
+procedure TPdfDocument.ApplyCcittDecode(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
+var
+  FO, PO, X, PItem, DObj: TPdfObject;
+  Parms: TPdfDictionaryObject;
+  I, K, Cols, Rws, OutW, OutH: Integer;
+  ByteAlign, Invert, IsCcitt: Boolean;
+  Gray: TPdfBytes;
+
+  function IsCcittName(const N: string): Boolean;
+  begin
+    Result := SameText(N, 'CCITTFaxDecode') or SameText(N, 'CCF');
+  end;
+
+begin
+  if (ImgE = nil) or (Length(ImgE.Data) = 0) then Exit;
+  IsCcitt := False;
+  Parms := nil;
+  FO := ResolveObject(Stm.Get('Filter'));
+  if not Assigned(FO) then Exit;
+  PO := ResolveObject(Stm.Get('DecodeParms'));
+  if not Assigned(PO) then PO := ResolveObject(Stm.Get('DP'));
+
+  if (FO.Kind = pokName) and IsCcittName(FO.AsName) then
+  begin
+    IsCcitt := True;
+    if PO is TPdfDictionaryObject then Parms := TPdfDictionaryObject(PO);
+  end
+  else if FO is TPdfArrayObject then
+    // CCITT may follow a transport filter (e.g. ASCII85); those were already
+    // undone by DecodeStream, so ImgE.Data holds the raw fax bits.
+    for I := 0 to TPdfArrayObject(FO).Items.Count - 1 do
+    begin
+      X := ResolveObject(TPdfObject(TPdfArrayObject(FO).Items[I]));
+      if Assigned(X) and (X.Kind = pokName) and IsCcittName(X.AsName) then
+      begin
+        IsCcitt := True;
+        if (PO is TPdfArrayObject) and (I < TPdfArrayObject(PO).Items.Count) then
+        begin
+          PItem := ResolveObject(TPdfObject(TPdfArrayObject(PO).Items[I]));
+          if PItem is TPdfDictionaryObject then Parms := TPdfDictionaryObject(PItem);
+        end
+        else if PO is TPdfDictionaryObject then
+          Parms := TPdfDictionaryObject(PO);
+        Break;
+      end;
+    end;
+  if not IsCcitt then Exit;
+
+  // Decode parameters (PDF 1.7, 7.4.6). Columns falls back to the image /Width
+  // (always matching in practice) rather than the spec default 1728.
+  K := 0;
+  if ImgE.Width > 0 then Cols := ImgE.Width else Cols := 1728;
+  Rws := ImgE.Height;
+  ByteAlign := False;
+  Invert := False;
+  if Assigned(Parms) then
+  begin
+    K := Trunc(Parms.GetNumber('K', 0));
+    Cols := Trunc(Parms.GetNumber('Columns', Cols));
+    Rws := Trunc(Parms.GetNumber('Rows', Rws));
+    ByteAlign := Parms.GetNumber('EncodedByteAlign', 0) <> 0;
+    // BlackIs1=false (default): the filter emits 0-bits for black, which the
+    // default Decode maps to black — same as our semantic gray output, so no
+    // inversion. BlackIs1=true flips the filter's sample polarity, so a viewer
+    // shows inverted output unless /Decode [1 0] flips it back.
+    if Parms.GetNumber('BlackIs1', 0) <> 0 then Invert := not Invert;
+  end;
+  if Cols <= 0 then Cols := 1728;
+  if Rws < 0 then Rws := 0;
+
+  // /Decode [1 0] inverts the samples.
+  DObj := ResolveObject(Stm.Get('Decode'));
+  if (DObj is TPdfArrayObject) and (TPdfArrayObject(DObj).Items.Count >= 2) then
+    if TPdfObject(TPdfArrayObject(DObj).Items[0]).AsNumber >
+       TPdfObject(TPdfArrayObject(DObj).Items[1]).AsNumber then
+      Invert := not Invert;
+
+  if not DecodeCCITTFax(ImgE.Data, K, Cols, Rws, ByteAlign, OutW, OutH, Gray) then Exit;
+  if Invert then
+    for I := 0 to High(Gray) do Gray[I] := 255 - Gray[I];
+
+  ImgE.Data := Gray;
+  ImgE.ColorSpace := 'DeviceGray';
+  ImgE.BitsPerComponent := 8;
+  if ImgE.Width <= 0 then ImgE.Width := OutW;
+  if ImgE.Height <= 0 then ImgE.Height := OutH;
 end;
 
 function TPdfDocument.ResolveObject(Obj: TPdfObject): TPdfObject;
@@ -3489,6 +3585,9 @@ begin
                       end;
                     end;
                     ImgE.Data := TPdfStreamObject(O3).DecodedData;
+                    // CCITT fax images: decode to 8-bit DeviceGray right here so
+                    // the element renders through the normal raster path.
+                    ApplyCcittDecode(TPdfStreamObject(O3), ImgE);
                     SetElemClip(ImgE);
                     Page.Elements.Add(ImgE);
                     ImgE := nil;  // ownership transferred
