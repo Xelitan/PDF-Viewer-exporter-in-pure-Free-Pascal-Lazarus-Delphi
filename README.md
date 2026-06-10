@@ -125,6 +125,7 @@ Stream filters:
 Images:
 - JPEG / DCTDecode: baseline and progressive, with grayscale, RGB, CMYK and Adobe YCCK source spaces. CMYK→RGB is done Adobe-aware.
 - Raw/Flate/LZW raster images in DeviceRGB, DeviceGray, DeviceCMYK, CalRGB, CalGray, and Indexed (palette) color.
+- CCITT Group 3/4 fax images (monochrome)
 - ICCBased images (RGB, CMYK, Gray).
 - Soft-mask transparency
 
@@ -135,7 +136,6 @@ Embedded font formats:
 ## PDF Features NOT supported
 
 Images:
-- CCITT Group 3/4 fax images (monochrome)
 - JBIG2 images (monochrome)
 - JPEG 2000 / JPXDecode
 - Lab color-space images
