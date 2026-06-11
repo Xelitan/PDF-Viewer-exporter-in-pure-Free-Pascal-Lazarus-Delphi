@@ -323,50 +323,50 @@ var
   bits: Cardinal;
   len, b: Integer;
 begin
-  bits := 0;
+    bits := 0;
 
-  for len := 1 to 13 do
-  begin
-    b := ReadBit(R);
-    if b < 0 then
-      Exit(g4EOF);
+    for len := 1 to 13 do
+    begin
+      b := ReadBit(R);
+      if b < 0 then
+        Exit(g4EOF);
 
-    bits := (bits shl 1) or Cardinal(b);
+      bits := (bits shl 1) or Cardinal(b);
 
-    case len of
-      1:
-        if bits = %1 then Exit(g4V0);
+      case len of
+        1:
+          if bits = 1 then Exit(g4V0); // %1
 
-      3:
-        case bits of
-          %001: Exit(g4Horizontal);
-          %011: Exit(g4VR1);
-          %010: Exit(g4VL1);
-        end;
+        3:
+          case bits of
+            1: Exit(g4Horizontal); // %001
+            3: Exit(g4VR1);        // %011
+            2: Exit(g4VL1);        // %010
+          end;
 
-      4:
-        if bits = %0001 then Exit(g4Pass);
+        4:
+          if bits = 1 then Exit(g4Pass); // %0001
 
-      6:
-        case bits of
-          %000011: Exit(g4VR2);
-          %000010: Exit(g4VL2);
-        end;
+        6:
+          case bits of
+            3: Exit(g4VR2); // %000011
+            2: Exit(g4VL2); // %000010
+          end;
 
-      7:
-        case bits of
-          %0000011: Exit(g4VR3);
-          %0000010: Exit(g4VL3);
-        end;
+        7:
+          case bits of
+            3: Exit(g4VR3); // %0000011
+            2: Exit(g4VL3); // %0000010
+          end;
 
-      12:
-        if bits = 1 then
-          Exit(g4EOF); // EOFB / EOL-like marker
+        12:
+          if bits = 1 then // %000000000001
+            Exit(g4EOF); // EOFB / EOL-like marker
+      end;
     end;
-  end;
 
-  // Unknown/extension code — treat as end-of-data.
-  Result := g4EOF;
+    // Unknown/extension code — treat as end-of-data.
+    Result := g4EOF;
 end;
 
 function NextChangingPixel(const Ref: array of Boolean; StartX: Integer;
