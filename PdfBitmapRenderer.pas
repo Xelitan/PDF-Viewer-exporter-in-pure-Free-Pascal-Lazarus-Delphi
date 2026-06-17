@@ -45,6 +45,7 @@ type
     function LoadTTFont(const BaseFont: string; const Data: TPdfBytes): Integer;
     procedure DrawTextElement(Bitmap: TBitmap; Page: TPdfPage; E: TPdfTextElement);
     procedure DrawImageElement(Bitmap: TBitmap; Page: TPdfPage; E: TPdfImageElement);
+    procedure DrawImageAlpha(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawRawDeviceGray(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawRawDeviceRGB(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawRawDeviceCMYK(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
@@ -176,9 +177,71 @@ stdcall;
 external 'gdiplus.dll';
 const CombineModeIntersect = 1;
 
+// GDI+ high-quality image scaling — GDI's StretchBlt only offers nearest/halftone;
+// GDI+ does proper (pre-filtered) bicubic, far smoother for up- and down-scaling.
+type
+  GpImage  = Pointer;
+  GpBitmap = Pointer;
+function GdipCreateBitmapFromHBITMAP(hbm: HBITMAP; hpal: HPALETTE; out bitmap: GpBitmap): GpStatus;
+stdcall; external 'gdiplus.dll';
+function GdipDisposeImage(image: GpImage): GpStatus;
+stdcall; external 'gdiplus.dll';
+function GdipSetInterpolationMode(graphics: GpGraphics; interpolationMode: Integer): GpStatus;
+stdcall; external 'gdiplus.dll';
+function GdipSetPixelOffsetMode(graphics: GpGraphics; pixelOffsetMode: Integer): GpStatus;
+stdcall; external 'gdiplus.dll';
+function GdipDrawImageRectI(graphics: GpGraphics; image: GpImage; x, y, width, height: Integer): GpStatus;
+stdcall; external 'gdiplus.dll';
+function GdipCreateBitmapFromScan0(width, height, stride, format: Integer; scan0: PByte; out bitmap: GpBitmap): GpStatus;
+stdcall; external 'gdiplus.dll';
+const
+  InterpolationModeHighQualityBicubic = 7;
+  PixelOffsetModeHalf                 = 2;   // sample pixel centres -> no half-texel edge shift
+  PixelFormat32bppARGB                = $0026200A;  // GDI+ 32bpp, non-premultiplied; bytes B,G,R,A
+
 var
   GGdiplusToken: ULONG_PTR = 0;
   GGdiplusOK: Boolean = False;
+
+// Blit Src into rectangle R of Dest, scaled with the best available quality:
+// GDI+ high-quality bicubic when available, else GDI HALFTONE (still better than
+// the default COLORONCOLOR). Shared by every raster image draw path.
+procedure DrawBitmapScaled(Dest: TBitmap; const R: TRect; Src: TBitmap);
+var
+  g: GpGraphics;
+  img: GpBitmap;
+  dw, dh, oldMode: Integer;
+begin
+  dw := R.Right - R.Left;
+  dh := R.Bottom - R.Top;
+  if (dw <= 0) or (dh <= 0) or (Src.Width <= 0) or (Src.Height <= 0) then Exit;
+
+  if GGdiplusOK then
+  begin
+    img := nil;
+    if (GdipCreateBitmapFromHBITMAP(Src.Handle, 0, img) = 0) and (img <> nil) then
+    begin
+      g := nil;
+      if GdipCreateFromHDC(Dest.Canvas.Handle, g) = 0 then
+      begin
+        GdipSetInterpolationMode(g, InterpolationModeHighQualityBicubic);
+        GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+        GdipDrawImageRectI(g, img, R.Left, R.Top, dw, dh);
+        GdipDeleteGraphics(g);
+        GdipDisposeImage(img);
+        Exit;
+      end;
+      GdipDisposeImage(img);
+    end;
+  end;
+
+  // GDI fallback: HALFTONE averages source pixels (good downscaling); requires a
+  // brush-origin reset per MSDN to avoid a colour shift.
+  oldMode := SetStretchBltMode(Dest.Canvas.Handle, HALFTONE);
+  SetBrushOrgEx(Dest.Canvas.Handle, 0, 0, nil);
+  Dest.Canvas.StretchDraw(R, Src);
+  SetStretchBltMode(Dest.Canvas.Handle, oldMode);
+end;
 
 constructor TPdfBitmapRenderer.Create;
 begin
@@ -732,6 +795,96 @@ begin
   SetTextAlign(DC, TA_LEFT or TA_TOP);  // restore default for other drawing
 end;
 
+// Composite an image that has per-pixel alpha (/SMask). Builds a 32bpp ARGB buffer
+// (RGB from the image data per colour space, A from E.Alpha) and draws it scaled to
+// R: GDI+ (bicubic, honours the alpha channel) when available, else GDI AlphaBlend
+// with a premultiplied source. Transparent areas show the page through.
+procedure TPdfBitmapRenderer.DrawImageAlpha(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
+var
+  W, H, x, y, i, idx, dw, dh: Integer;
+  r8, g8, b8, a: Byte;
+  CS: string;
+  rgb: Boolean;
+  buf: array of Byte;          // BGRA, non-premultiplied (for GDI+)
+  img: GpBitmap;
+  g: GpGraphics;
+  Src: TBitmap;
+  Dst: PByte;
+  BF: TBlendFunction;
+begin
+  W := E.Width; H := E.Height;
+  dw := R.Right - R.Left; dh := R.Bottom - R.Top;
+  if (W <= 0) or (H <= 0) or (dw <= 0) or (dh <= 0) or (Length(E.Alpha) < W*H) then Exit;
+  CS := E.ColorSpace;
+  rgb := SameText(CS,'DeviceRGB') or SameText(CS,'CalRGB') or SameText(CS,'ICCBased') or (CS = '');
+
+  SetLength(buf, W * H * 4);
+  for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      i := y*W + x;
+      if rgb and (i*3 + 2 < Length(E.Data)) then
+      begin r8 := E.Data[i*3]; g8 := E.Data[i*3+1]; b8 := E.Data[i*3+2]; end
+      else if SameText(CS,'Indexed') and (i < Length(E.Data)) then
+      begin
+        idx := E.Data[i];
+        if (idx*3 + 2 < Length(E.Palette)) then
+        begin r8 := E.Palette[idx*3]; g8 := E.Palette[idx*3+1]; b8 := E.Palette[idx*3+2]; end
+        else begin r8 := 0; g8 := 0; b8 := 0; end;
+      end
+      else if i < Length(E.Data) then begin r8 := E.Data[i]; g8 := r8; b8 := r8; end
+      else begin r8 := 0; g8 := 0; b8 := 0; end;
+      a := E.Alpha[i];
+      buf[i*4+0] := b8;     // GDI+ 32bppARGB byte order is B,G,R,A
+      buf[i*4+1] := g8;
+      buf[i*4+2] := r8;
+      buf[i*4+3] := a;
+    end;
+
+  if GGdiplusOK then
+  begin
+    img := nil;
+    if (GdipCreateBitmapFromScan0(W, H, W*4, PixelFormat32bppARGB, @buf[0], img) = 0) and (img <> nil) then
+    begin
+      g := nil;
+      if GdipCreateFromHDC(Bitmap.Canvas.Handle, g) = 0 then
+      begin
+        GdipSetInterpolationMode(g, InterpolationModeHighQualityBicubic);
+        GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+        GdipDrawImageRectI(g, img, R.Left, R.Top, dw, dh);
+        GdipDeleteGraphics(g);
+        GdipDisposeImage(img);
+        Exit;
+      end;
+      GdipDisposeImage(img);
+    end;
+  end;
+
+  // GDI fallback: premultiplied BGRA + AlphaBlend.
+  Src := TBitmap.Create;
+  try
+    Src.PixelFormat := pf32bit;
+    Src.SetSize(W, H);
+    for y := 0 to H - 1 do
+    begin
+      Dst := Src.ScanLine[y];
+      for x := 0 to W - 1 do
+      begin
+        i := y*W + x; a := buf[i*4+3];
+        Dst[x*4+0] := (buf[i*4+0] * a) div 255;
+        Dst[x*4+1] := (buf[i*4+1] * a) div 255;
+        Dst[x*4+2] := (buf[i*4+2] * a) div 255;
+        Dst[x*4+3] := a;
+      end;
+    end;
+    BF.BlendOp := AC_SRC_OVER; BF.BlendFlags := 0;
+    BF.SourceConstantAlpha := 255; BF.AlphaFormat := AC_SRC_ALPHA;
+    AlphaBlend(Bitmap.Canvas.Handle, R.Left, R.Top, dw, dh, Src.Canvas.Handle, 0, 0, W, H, BF);
+  finally
+    Src.Free;
+  end;
+end;
+
 procedure TPdfBitmapRenderer.DrawRawDeviceGray(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
 var
   TmpBmp: TBitmap;
@@ -764,7 +917,7 @@ begin
         Dst[X * 3 + 2] := G;  // R
       end;
     end;
-    Bitmap.Canvas.StretchDraw(R, TmpBmp);
+    DrawBitmapScaled(Bitmap, R, TmpBmp);
   finally
     TmpBmp.Free;
   end;
@@ -800,7 +953,7 @@ begin
         Dst[X * 3 + 2] := Src[X * 3 + 0];  // R ← B
       end;
     end;
-    Bitmap.Canvas.StretchDraw(R, TmpBmp);
+    DrawBitmapScaled(Bitmap, R, TmpBmp);
   finally
     TmpBmp.Free;
   end;
@@ -837,7 +990,7 @@ begin
         Dst[X*3+2] := Byte((255 - c)  * (255 - k) div 255);  // R
       end;
     end;
-    Bitmap.Canvas.StretchDraw(R, TmpBmp);
+    DrawBitmapScaled(Bitmap, R, TmpBmp);
   finally
     TmpBmp.Free;
   end;
@@ -885,7 +1038,7 @@ begin
         Dst[X*3+2] := E.Palette[Idx*3+0];  // R
       end;
     end;
-    Bitmap.Canvas.StretchDraw(R, TmpBmp);
+    DrawBitmapScaled(Bitmap, R, TmpBmp);
   finally
     TmpBmp.Free;
   end;
@@ -1426,7 +1579,7 @@ begin
           Dst[X*3 + 2] := RGB[(Y*W + X)*3 + 0];  // R
         end;
       end;
-      Bitmap.Canvas.StretchDraw(R, TmpBmp);
+      DrawBitmapScaled(Bitmap, R, TmpBmp);
     finally
       TmpBmp.Free;
     end;
@@ -1442,7 +1595,7 @@ begin
     MS.Position := 0;
     JpegImg.LoadFromStream(MS);
     TmpBmp.Assign(JpegImg);
-    Bitmap.Canvas.StretchDraw(R, TmpBmp);
+    DrawBitmapScaled(Bitmap, R, TmpBmp);
   except
     DrawPlaceholder(Bitmap, R, E.Name);
   end;
@@ -1484,6 +1637,13 @@ begin
   if (Length(E.Data) >= 2) and (E.Data[0] = $FF) and (E.Data[1] = $D8) then
   begin
     DrawJpegImage(Bitmap, R, E);
+    Exit;
+  end;
+
+  // Image with a per-pixel /SMask -> composite with transparency (PNG alpha).
+  if (Length(E.Alpha) = E.Width * E.Height) and (E.Width > 0) and (E.Height > 0) then
+  begin
+    DrawImageAlpha(Bitmap, R, E);
     Exit;
   end;
 
@@ -1742,13 +1902,49 @@ begin
   end;
 end;
 
+// Rotate a 24-bit bitmap clockwise by 90/180/270 degrees (per PDF /Rotate, which
+// is the clockwise display rotation). Returns a new bitmap; dims swap for 90/270.
+function RotateBitmap24(Src: TBitmap; Degrees: Integer): TBitmap;
+var
+  sw, sh, dw, dh, x, y, sx, sy: Integer;
+  dp: PByte;
+  srow: array of PByte;
+begin
+  Result := TBitmap.Create;
+  Result.PixelFormat := pf24bit;
+  sw := Src.Width; sh := Src.Height;
+  if (Degrees = 90) or (Degrees = 270) then begin dw := sh; dh := sw; end
+  else begin dw := sw; dh := sh; end;
+  Result.SetSize(dw, dh);
+  if (sw = 0) or (sh = 0) then Exit;
+  SetLength(srow, sh);
+  for y := 0 to sh - 1 do srow[y] := Src.ScanLine[y];
+  sx := 0; sy := 0;
+  for y := 0 to dh - 1 do
+  begin
+    dp := Result.ScanLine[y];
+    for x := 0 to dw - 1 do
+    begin
+      case Degrees of
+        90:  begin sx := y;          sy := sh - 1 - x; end;
+        180: begin sx := sw - 1 - x; sy := sh - 1 - y; end;
+        270: begin sx := sw - 1 - y; sy := x;          end;
+      end;
+      dp[x*3+0] := srow[sy][sx*3+0];
+      dp[x*3+1] := srow[sy][sx*3+1];
+      dp[x*3+2] := srow[sy][sx*3+2];
+    end;
+  end;
+end;
+
 procedure TPdfBitmapRenderer.RenderPageToBitmap(Page: TPdfPage; Bitmap: TBitmap);
 var
   I: Integer;
   E: TPdfPageElement;
-  W, H: Integer;
+  W, H, Rot: Integer;
   ClipRgn: HRGN;
   cl, ct, cr, cb, t: Integer;
+  Rotated: TBitmap;
 begin
   if not Assigned(Page) then
     raise Exception.Create('Page is nil');
@@ -1756,6 +1952,11 @@ begin
     raise Exception.Create('Bitmap is nil');
   Page.EnsureParsed;  // lazily interpret this page's content on first render
 
+  // Render in unrotated page space; the whole bitmap is rotated at the end so
+  // every element (text, images, paths) rotates together. pf24bit is required by
+  // the ScanLine-based rotate.
+  Rot := Page.Rotation;
+  Bitmap.PixelFormat := pf24bit;
   W := Max(1, Round(Page.Width * FOptions.Scale));
   H := Max(1, Round(Page.Height * FOptions.Scale));
   Bitmap.SetSize(W, H);
@@ -1827,6 +2028,18 @@ begin
     begin
       SelectClipRgn(Bitmap.Canvas.Handle, 0);
       DeleteObject(ClipRgn);
+    end;
+  end;
+
+  // Apply the page's /Rotate by rotating the finished bitmap.
+  if (Rot = 90) or (Rot = 180) or (Rot = 270) then
+  begin
+    Rotated := RotateBitmap24(Bitmap, Rot);
+    try
+      Bitmap.SetSize(Rotated.Width, Rotated.Height);
+      Bitmap.Canvas.Draw(0, 0, Rotated);
+    finally
+      Rotated.Free;
     end;
   end;
 end;

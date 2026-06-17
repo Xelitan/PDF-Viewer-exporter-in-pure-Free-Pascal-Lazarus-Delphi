@@ -82,7 +82,7 @@ begin
   Pdf.Align := alClient;
   PDf.AutoFit := afWidth;
 
-  Pdf.LoadFromFile('test.pdf');
+  Pdf.LoadFromFile('google-doc-document.pdf');
 
 end;
 
@@ -104,7 +104,7 @@ end;
 
 procedure TForm1.MenuItem19Click(Sender: TObject);
 begin
-  //Pdf.Document.RotateRight(Pdf.CurrentPage);
+  Pdf.Document.RotateRight(Pdf.CurrentPage);
 end;
 
 procedure TForm1.MenuItem3Click(Sender: TObject);
@@ -126,7 +126,7 @@ end;
 
 procedure TForm1.MenuItem7Click(Sender: TObject);
 begin
-  //Pdf.Document.RotateLeft(Pdf.CurrentPage);
+  Pdf.Document.RotateLeft(Pdf.CurrentPage);
 end;
 
 procedure TForm1.MenuItem8Click(Sender: TObject);

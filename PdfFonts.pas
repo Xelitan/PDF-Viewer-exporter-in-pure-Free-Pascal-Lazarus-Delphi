@@ -53,6 +53,13 @@ type
     BaseFont: string;
     Subtype: string;
     EncodingName: string;
+    // Type3 font state (Subtype /Type3): glyphs are arbitrary content streams
+    // (CharProcs) drawn in glyph space mapped through Type3Matrix. The parser
+    // fills these and renders each glyph by interpreting its CharProc.
+    IsType3: Boolean;
+    Type3Matrix: TPdfMatrix;                 // /FontMatrix (glyph space -> text space)
+    Type3CharProcs: TPdfDictionaryObject;    // glyph name -> CharProc stream (ref, not owned)
+    Type3Resources: TPdfDictionaryObject;    // resources for the CharProc streams (ref)
 
     constructor Create;
     destructor Destroy;
@@ -75,6 +82,9 @@ type
 
     function WidthOfCode(Code: Integer): Double;
     function IsVerticalWriting: Boolean;
+    // Glyph name for a character code (from /Encoding /Differences) — needed to
+    // look up the right CharProc for a Type3 glyph.
+    function GlyphName(Code: Integer): string;
 
     property CIDRegistry: string read FCIDRegistry;
     property CIDOrdering: string read FCIDOrdering;
@@ -859,6 +869,11 @@ end;
 function TPdfFont.IsVerticalWriting: Boolean;
 begin
   Result := FVertical;
+end;
+
+function TPdfFont.GlyphName(Code: Integer): string;
+begin
+  Result := GlyphNameForCode(Code);
 end;
 
 end.

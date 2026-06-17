@@ -82,6 +82,9 @@ type
     Palette: TPdfBytes;  // for Indexed: expanded RGB triples (3*(hival+1) bytes)
     PaletteCount: Integer;  // number of palette entries (hival+1)
     Data: TPdfBytes;
+    // Per-pixel alpha from the image's /SMask (Width*Height bytes, 255=opaque),
+    // or empty if the image is fully opaque. Gives PNG-style transparency.
+    Alpha: TPdfBytes;
     constructor Create(AKind: TPdfPageElementKind = pekImage);
   end;
 
@@ -179,6 +182,7 @@ type
     CropBox: TPdfRect;
     Width: Double;
     Height: Double;
+    Rotation: Integer;  // /Rotate: page display rotation, normalized to 0/90/180/270 (clockwise)
     LinkRects: array of TPdfRect;  // bounding boxes of /Link annotations
     LinkURLs:  array of string;  // parallel to LinkRects: external URI target ('' for non-URI links)
     RawContent: TPdfBytes;  // decoded concatenated content stream (for PdfWriter)
@@ -191,6 +195,9 @@ type
     PageDict: TPdfDictionaryObject;
     Parsed: Boolean;
     procedure EnsureParsed;
+    // Display dimensions with /Rotate applied: width and height swap for 90/270.
+    function EffectiveWidth: Double;
+    function EffectiveHeight: Double;
     constructor Create;
     destructor Destroy;
     override;
@@ -318,7 +325,7 @@ type
 
     procedure SetupEncryption;
     procedure BuildPages;
-    procedure WalkPageTree(PageDict: TPdfDictionaryObject; ParentResources: TPdfDictionaryObject);
+    procedure WalkPageTree(PageDict: TPdfDictionaryObject; ParentResources: TPdfDictionaryObject; ParentRotate: Integer = 0);
     procedure ParsePageContent(Page: TPdfPage; PageDict, Resources: TPdfDictionaryObject);
     procedure ParseAnnotations(Page: TPdfPage; PageDict: TPdfDictionaryObject);
     procedure InterpretContent(Page: TPdfPage; const Bytes: TPdfBytes; Resources: TPdfDictionaryObject; const InitialCTM: TPdfMatrix; InitialSoftMask: TObject = nil; InitialMark: Integer = -1);
@@ -353,6 +360,9 @@ type
     // CCITTFaxDecode: if the image stream uses it, decode the fax bits to 8-bit
     // DeviceGray so the normal raster pipeline can render/export the image.
     procedure ApplyCcittDecode(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
+    // Decode the image's /SMask (a DeviceGray image) into ImgE.Alpha, scaled to the
+    // base image's dimensions. Gives per-pixel transparency (PNG alpha).
+    procedure ApplyImageSMask(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
   public
     constructor Create;
     overload;
@@ -400,6 +410,11 @@ type
     procedure RenderPageToPng(PageIndex: Integer; const FileName: string);
     procedure Zoom(Scale: Extended);
     procedure ImportPDF(Str: TStream; PageFrom, PageTo, ImportAfterPage: Integer);
+    // Rotate a page 90° left (counter-clockwise) or right (clockwise). Updates the
+    // page's /Rotate attribute so the change persists when the document is saved.
+    procedure RotateLeft(PageIndex: Integer);
+    procedure RotateRight(PageIndex: Integer);
+    procedure SetPageRotation(PageIndex, Degrees: Integer);  // absolute (normalized to 0/90/180/270)
     property Pages: TObjectList read FPages;
   end;
 
@@ -791,6 +806,14 @@ begin
   Parsed := True;  // set before parsing so re-entrancy (forms/masks) can't loop
   if Assigned(OwnerDoc) and Assigned(PageDict) then
     TPdfDocument(OwnerDoc).ParsePageContent(Self, PageDict, Resources);
+end;
+function TPdfPage.EffectiveWidth: Double;
+begin
+  if (Rotation = 90) or (Rotation = 270) then Result := Height else Result := Width;
+end;
+function TPdfPage.EffectiveHeight: Double;
+begin
+  if (Rotation = 90) or (Rotation = 270) then Result := Width else Result := Height;
 end;
 
 destructor TPdfSoftMask.Destroy;
@@ -1676,6 +1699,47 @@ begin
   if ImgE.Height <= 0 then ImgE.Height := OutH;
 end;
 
+procedure TPdfDocument.ApplyImageSMask(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
+var
+  SMObj: TPdfObject;
+  SM: TPdfStreamObject;
+  smW, smH, bpc, x, y, sx, sy: Integer;
+  raw: TPdfBytes;
+  W, H: Integer;
+begin
+  if (ImgE = nil) or (ImgE.Width <= 0) or (ImgE.Height <= 0) then Exit;
+  SMObj := ResolveObject(Stm.Get('SMask'));
+  if not (SMObj is TPdfStreamObject) then Exit;
+  SM := TPdfStreamObject(SMObj);
+  smW := Trunc(SM.GetNumber('Width'));
+  smH := Trunc(SM.GetNumber('Height'));
+  bpc := Trunc(SM.GetNumber('BitsPerComponent', 8));
+  if (smW <= 0) or (smH <= 0) then Exit;
+  // The SMask is a DeviceGray image; its decoded samples ARE the alpha values.
+  // Only 8-bit gray is handled (the common case for PNG-derived alpha).
+  if bpc <> 8 then Exit;
+  raw := SM.DecodedData;
+  if Length(raw) < smW * smH then Exit;
+
+  W := ImgE.Width; H := ImgE.Height;
+  SetLength(ImgE.Alpha, W * H);
+  if (smW = W) and (smH = H) then
+  begin
+    Move(raw[0], ImgE.Alpha[0], W * H);
+  end
+  else
+    // Nearest-neighbour resample the mask to the base image's grid.
+    for y := 0 to H - 1 do
+    begin
+      sy := (y * smH) div H;
+      for x := 0 to W - 1 do
+      begin
+        sx := (x * smW) div W;
+        ImgE.Alpha[y * W + x] := raw[sy * smW + sx];
+      end;
+    end;
+end;
+
 function TPdfDocument.ResolveObject(Obj: TPdfObject): TPdfObject;
 begin
   if Assigned(Obj) and (Obj.Kind=pokReference) then Result := LoadIndirectObject(TPdfReferenceObject(Obj).ObjectNumber) else Result := Obj;
@@ -1786,6 +1850,27 @@ begin
         FirstChar := Trunc(TPdfDictionaryObject(FontObj).GetNumber('FirstChar', 0));
         Font.LoadWidths(WidthsObj, FirstChar);
       end;
+      // Type3 font: glyphs are CharProc content streams drawn in glyph space via
+      // /FontMatrix, using the font's own /Resources. Capture them so ShowText can
+      // render each glyph (e.g. colour-emoji flags whose CharProcs draw images).
+      if SameText(TPdfDictionaryObject(FontObj).GetName('Subtype'), 'Type3') then
+      begin
+        Font.IsType3 := True;
+        Font.Type3Matrix := PdfIdentityMatrix;
+        FFObj := ResolveObject(TPdfDictionaryObject(FontObj).Get('FontMatrix'));
+        if (FFObj is TPdfArrayObject) and (TPdfArrayObject(FFObj).Items.Count >= 6) then
+          Font.Type3Matrix := PdfMatrixFrom(
+            TPdfObject(TPdfArrayObject(FFObj).Items[0]).AsNumber,
+            TPdfObject(TPdfArrayObject(FFObj).Items[1]).AsNumber,
+            TPdfObject(TPdfArrayObject(FFObj).Items[2]).AsNumber,
+            TPdfObject(TPdfArrayObject(FFObj).Items[3]).AsNumber,
+            TPdfObject(TPdfArrayObject(FFObj).Items[4]).AsNumber,
+            TPdfObject(TPdfArrayObject(FFObj).Items[5]).AsNumber);
+        FFObj := ResolveObject(TPdfDictionaryObject(FontObj).Get('CharProcs'));
+        if FFObj is TPdfDictionaryObject then Font.Type3CharProcs := TPdfDictionaryObject(FFObj);
+        FFObj := ResolveObject(TPdfDictionaryObject(FontObj).Get('Resources'));
+        if FFObj is TPdfDictionaryObject then Font.Type3Resources := TPdfDictionaryObject(FFObj);
+      end;
       // ToUnicode maps encoded bytes to Unicode; without it CID text is unreadable.
       TUObj := ResolveObject(TPdfDictionaryObject(FontObj).Get('ToUnicode'));
       if TUObj is TPdfStreamObject then begin
@@ -1859,6 +1944,14 @@ begin
     Result.X2 := TPdfObject(Arr.Items[2]).AsNumber;
     Result.Y2 := TPdfObject(Arr.Items[3]).AsNumber;
   end;
+end;
+
+// Normalize any /Rotate value to one of 0, 90, 180, 270 (clockwise).
+function NormRotate(N: Integer): Integer;
+begin
+  N := ((N div 90) * 90) mod 360;   // snap to a multiple of 90, then wrap
+  if N < 0 then N := N + 360;
+  Result := N;
 end;
 
 procedure SetupPageBoxes(Page: TPdfPage; Doc: TPdfDocument; PageDict: TPdfDictionaryObject);
@@ -2016,21 +2109,28 @@ begin
     if Pages is TPdfDictionaryObject then WalkPageTree(TPdfDictionaryObject(Pages), nil);
   end;
 end;
-procedure TPdfDocument.WalkPageTree(PageDict: TPdfDictionaryObject; ParentResources: TPdfDictionaryObject);
+procedure TPdfDocument.WalkPageTree(PageDict: TPdfDictionaryObject; ParentResources: TPdfDictionaryObject; ParentRotate: Integer);
 var T: string;
-  KidsObj, K: TPdfObject;
+  KidsObj, K, RotObj: TPdfObject;
   Kids: TPdfArrayObject;
-  I: Integer;
+  I, Rot: Integer;
   R: TPdfDictionaryObject;
   Page: TPdfPage;
 begin
   R := ParentResources;
   K := ResolveObject(PageDict.Get('Resources'));
   if K is TPdfDictionaryObject then R := TPdfDictionaryObject(K);
+  // /Rotate is an inheritable page attribute (PDF 7.7.3.3). Use this node's own
+  // value if present, otherwise inherit from the parent Pages node.
+  Rot := ParentRotate;
+  RotObj := ResolveObject(PageDict.Get('Rotate'));
+  if Assigned(RotObj) and (RotObj.Kind in [pokInteger, pokReal]) then
+    Rot := NormRotate(Trunc(RotObj.AsNumber));
   T := PageDict.GetName('Type');
   if T='Page' then begin
     Page := TPdfPage.Create;
     Page.Resources := R;
+    Page.Rotation := Rot;
     SetupPageBoxes(Page, Self, PageDict);
     Page.OwnerDoc := Self;
     Page.PageDict := PageDict;
@@ -2042,7 +2142,7 @@ begin
       Kids := TPdfArrayObject(KidsObj);
       for I := 0 to Kids.Items.Count-1 do begin
         K := ResolveObject(TPdfObject(Kids.Items[I]));
-        if K is TPdfDictionaryObject then WalkPageTree(TPdfDictionaryObject(K), R);
+        if K is TPdfDictionaryObject then WalkPageTree(TPdfDictionaryObject(K), R, Rot);
       end;
     end;
   end;
@@ -2894,6 +2994,47 @@ var S: AnsiString;
       Inc(I);
     end;
   end;
+  // Render one Type3 glyph: interpret its CharProc content stream under the
+  // glyph→device matrix (FontMatrix × textsize × text matrix × CTM), using the
+  // font's own /Resources. CharProcs that draw images (colour-emoji flags) or
+  // vector paths thus render through the normal element pipeline.
+  procedure ShowType3(F: TPdfFont; const Raw: AnsiString);
+  var i, code: Integer;
+    gname: string;
+    cpObj: TPdfObject;
+    Tfs, Th, Tr, w0, tx: Double;
+    tsm, gm: TPdfMatrix;
+    res: TPdfDictionaryObject;
+  begin
+    Tfs := GS.Current.FontSize;
+    Th  := GS.Current.HorizontalScaling / 100.0;
+    Tr  := GS.Current.TextRise;
+    for i := 1 to Length(Raw) do
+    begin
+      code := Ord(Raw[i]);
+      gname := F.GlyphName(code);
+      if (gname <> '') and Assigned(F.Type3CharProcs) then
+      begin
+        cpObj := ResolveObject(F.Type3CharProcs.Get(gname));
+        if cpObj is TPdfStreamObject then
+        begin
+          // glyph space -> device: FontMatrix · [Tfs·Th 0 0 Tfs 0 Trise] · Tm · CTM
+          tsm := PdfMatrixFrom(Tfs*Th, 0, 0, Tfs, 0, Tr);
+          gm  := PdfMatrixMultiply(F.Type3Matrix, tsm);
+          gm  := PdfMatrixMultiply(gm, GS.Current.TextMatrix);
+          gm  := PdfMatrixMultiply(gm, GS.Current.CTM);
+          if Assigned(F.Type3Resources) then res := F.Type3Resources else res := Resources;
+          InterpretContent(Page, TPdfStreamObject(cpObj).DecodedData, res, gm, GS.Current.SoftMask, CurMark);
+        end;
+      end;
+      // Advance: glyph-space width mapped to text space via FontMatrix, then scaled.
+      w0 := F.WidthOfCode(code) * F.Type3Matrix.A;
+      tx := (w0 * Tfs + GS.Current.CharSpacing) * Th;
+      if code = 32 then tx := tx + GS.Current.WordSpacing * Th;
+      GS.Current.TextMatrix := PdfMatrixMultiply(PdfMatrixTranslate(tx, 0), GS.Current.TextMatrix);
+    end;
+  end;
+
   procedure ShowText(const Raw: AnsiString);
   var E: TPdfTextElement;
     F: TPdfFont;
@@ -2901,6 +3042,8 @@ var S: AnsiString;
     Adv, CA, ScaleA: Double;
       RawLen, TextLen, CID: Integer;
   begin
+    F := TPdfFont(Fonts.Find(GS.Current.FontName));
+    if Assigned(F) and F.IsType3 then begin ShowType3(F, Raw); Exit; end;
     E := TPdfTextElement.Create;
     E.FontName := GS.Current.FontName;
     E.FontSize := GS.Current.FontSize;
@@ -3545,6 +3688,11 @@ begin
           if Assigned(O1) then GS.Current.TextRise:=O1.AsNumber;
           O1.Free;
         end
+        // Type3 glyph metric operators (appear at the start of a CharProc):
+        // d0 = wx wy ; d1 = wx wy llx lly urx ury. The advance comes from /Widths,
+        // so just discard the operands here.
+        else if T='d0' then begin PopObj.Free; PopObj.Free; end
+        else if T='d1' then begin PopObj.Free; PopObj.Free; PopObj.Free; PopObj.Free; PopObj.Free; PopObj.Free; end
         else if T='Do' then
         begin
           O1 := PopObj;
@@ -3588,6 +3736,8 @@ begin
                     // CCITT fax images: decode to 8-bit DeviceGray right here so
                     // the element renders through the normal raster path.
                     ApplyCcittDecode(TPdfStreamObject(O3), ImgE);
+                    // /SMask -> per-pixel alpha (PNG transparency).
+                    ApplyImageSMask(TPdfStreamObject(O3), ImgE);
                     SetElemClip(ImgE);
                     Page.Elements.Add(ImgE);
                     ImgE := nil;  // ownership transferred
@@ -4575,6 +4725,11 @@ begin
       WS(' ');
       WF(Page.MediaBox.Y2);
       WS(']');
+      if Page.Rotation <> 0 then
+      begin
+        WS(' /Rotate ');
+        WI(Page.Rotation);
+      end;
       WS(' /Contents ');
       WI(ContentNums[PageI]);
       WS(' 0 R');
@@ -5300,6 +5455,27 @@ end;
 procedure TPdfDocument.Zoom(Scale: Extended);
 begin
   if Scale > 0 then FRenderZoom := Scale;
+end;
+
+// Set a page's /Rotate to an absolute value (normalized). The renderer reads
+// Page.Rotation to display the page rotated, and SaveToStream emits /Rotate from
+// it, so the change both shows immediately and persists in the saved file.
+procedure TPdfDocument.SetPageRotation(PageIndex, Degrees: Integer);
+begin
+  if (PageIndex < 0) or (PageIndex >= FPages.Count) then Exit;
+  TPdfPage(FPages[PageIndex]).Rotation := NormRotate(Degrees);
+end;
+
+procedure TPdfDocument.RotateRight(PageIndex: Integer);
+begin
+  if (PageIndex >= 0) and (PageIndex < FPages.Count) then
+    SetPageRotation(PageIndex, TPdfPage(FPages[PageIndex]).Rotation + 90);
+end;
+
+procedure TPdfDocument.RotateLeft(PageIndex: Integer);
+begin
+  if (PageIndex >= 0) and (PageIndex < FPages.Count) then
+    SetPageRotation(PageIndex, TPdfPage(FPages[PageIndex]).Rotation - 90);
 end;
 
 // Import pages [PageFrom..PageTo] of the PDF in Str, inserting them after page
