@@ -162,7 +162,17 @@ procedure TPdfDictionaryObject.Add(const Key: string; Obj: TPdfObject);
 var I: Integer;
 begin
   I := Keys.IndexOf(Key);
-  if I >= 0 then Keys.Objects[I] := Obj else Keys.AddObject(Key, Obj);
+  if I >= 0 then
+  begin
+    // Replacing a duplicate key: free the previous value first. OwnsObjects only
+    // frees on Delete/Clear/Destroy, NOT on a direct Objects[] assignment, so an
+    // overwrite would otherwise orphan (leak) the old value. Dict values are owned
+    // solely by the dict, so this is safe.
+    if Keys.Objects[I] <> TObject(Obj) then Keys.Objects[I].Free;
+    Keys.Objects[I] := Obj;
+  end
+  else
+    Keys.AddObject(Key, Obj);
 end;
 function TPdfDictionaryObject.Get(const Key: string): TPdfObject;
 var I: Integer;
