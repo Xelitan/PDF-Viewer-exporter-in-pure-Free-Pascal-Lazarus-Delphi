@@ -29,9 +29,13 @@ type
 
   TLoadedFontEntry = record
     BaseFont: string;
+    ProgSig: LongWord;         // signature of the embedded program (disambiguates
+                               // subsets that share a BaseFont name, e.g. several
+                               // distinct "ArialMT-Identity-H" CID subsets)
     GDIHandle: Pointer;
     FamilyName: string;
     Subfamily: string;
+    CidToGid: array of Word;   // non-empty for CID-keyed CFF: maps CID -> GID
   end;
 
   TPdfBitmapRenderer = class
@@ -44,6 +48,7 @@ type
     function MatrixScaleY(const M: TPdfMatrix): Double;
     function LoadTTFont(const BaseFont: string; const Data: TPdfBytes): Integer;
     procedure DrawTextElement(Bitmap: TBitmap; Page: TPdfPage; E: TPdfTextElement);
+    procedure DrawGlyphRun(Bitmap: TBitmap; E: TPdfTextElement; X, Y, CacheIdx: Integer; DC: HDC);
     procedure DrawImageElement(Bitmap: TBitmap; Page: TPdfPage; E: TPdfImageElement);
     procedure DrawImageAlpha(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawRawDeviceGray(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
@@ -418,18 +423,28 @@ var
   IsCFF: Boolean;
   LoadData: TPdfBytes;
   Fam: string;
+  Sig: LongWord;
 begin
+  // Signature of the embedded program: distinct font subsets often SHARE a BaseFont
+  // name (e.g. many "ArialMT-Identity-H" CID subsets), so the cache must key on the
+  // actual bytes, not just the name — otherwise every run reuses the first subset's
+  // glyphs/charset and renders the wrong text.
+  Sig := LongWord(Length(Data));
+  for I := 0 to High(Data) do Sig := Sig * 31 + Data[I];
+
   // Return cached entry if already loaded.
   for I := 0 to High(FLoadedFonts) do
-    if FLoadedFonts[I].BaseFont = BaseFont then Exit(I);
+    if (FLoadedFonts[I].BaseFont = BaseFont) and (FLoadedFonts[I].ProgSig = Sig) then Exit(I);
 
   Result := -1;
   if Length(Data) = 0 then Exit;
 
   Entry.BaseFont  := BaseFont;
+  Entry.ProgSig   := Sig;
   Entry.GDIHandle := nil;
   Entry.FamilyName := '';
   Entry.Subfamily  := '';
+  SetLength(Entry.CidToGid, 0);
 
   // A bare CFF (Type1C) starts with version byte 1; TrueType/OpenType begins
   // with 0x00010000 / 'OTTO' / 'true'. GDI can't load bare CFF, so wrap it in an
@@ -443,6 +458,9 @@ begin
     if Length(LoadData) = 0 then Exit;  // wrap failed -> caller substitutes
     Entry.FamilyName := Fam;  // embedded outlines carry their own weight
     Entry.Subfamily  := '';  // so no synthetic bold/italic
+    // CID-keyed CFF: the content stream's CIDs are not the GIDs — capture the
+    // charset's CID->GID map so the renderer can draw by glyph index.
+    Entry.CidToGid := CFFCidToGid(Data);
   end
   else
   begin
@@ -607,6 +625,49 @@ begin
     Include(Style, fsItalic);
 end;
 
+// Draw a run of glyph IDs (CID=GID) at device baseline (X,Y) using the font already
+// selected into DC, with explicit per-glyph device advances from E.GlyphAdv (page
+// space × Scale, accumulated to avoid rounding drift).
+procedure TPdfBitmapRenderer.DrawGlyphRun(Bitmap: TBitmap; E: TPdfTextElement; X, Y, CacheIdx: Integer; DC: HDC);
+const ETO_GI = $0010;   // ETO_GLYPH_INDEX
+var
+  n, i, prevMode, cid: Integer;
+  gids: array of Word;
+  dx: array of Integer;
+  accPg: Double;
+  accDev, dev: Integer;
+  hasMap: Boolean;
+begin
+  n := Length(E.GlyphIDs);
+  if n = 0 then Exit;
+  hasMap := (CacheIdx >= 0) and (Length(FLoadedFonts[CacheIdx].CidToGid) > 0);
+  SetLength(gids, n);
+  SetLength(dx, n);
+  accPg := 0; accDev := 0;
+  for i := 0 to n - 1 do
+  begin
+    cid := E.GlyphIDs[i];
+    // CID -> GID via the CFF charset (CID is NOT the GID for a subset CID-CFF).
+    if hasMap and (cid < Length(FLoadedFonts[CacheIdx].CidToGid)) then
+      gids[i] := FLoadedFonts[CacheIdx].CidToGid[cid]
+    else
+      gids[i] := Word(cid);
+    accPg := accPg + E.GlyphAdv[i];
+    dev := Round(accPg * FOptions.Scale);
+    dx[i] := dev - accDev;       // device advance for this glyph (drift-corrected)
+    accDev := dev;
+  end;
+  // Realize the LCL Canvas font into the raw DC. We draw with raw ExtTextOutW (not
+  // a Canvas method), so LCL hasn't necessarily selected the current Font into the
+  // DC — without this the DC keeps a previous element's HFONT and the glyph indices
+  // are drawn from the WRONG font.
+  SelectObject(DC, Bitmap.Canvas.Font.Reference.Handle);
+  prevMode := SetTextAlign(DC, TA_LEFT or TA_BASELINE);
+  SetBkMode(DC, TRANSPARENT);
+  ExtTextOutW(DC, X, Y, ETO_GI, nil, PWideChar(@gids[0]), n, @dx[0]);
+  SetTextAlign(DC, prevMode);
+end;
+
 procedure TPdfBitmapRenderer.DrawTextElement(Bitmap: TBitmap; Page: TPdfPage; E: TPdfTextElement);
 var
   X, Y, SizePx, CacheIdx, IntendedW, NaturalW, DrawX, DrawY: Integer;
@@ -664,8 +725,20 @@ begin
     Bitmap.Canvas.Font.Style := Style;
   end;
 
-  S := UTF8Encode(E.Text);
   DC := Bitmap.Canvas.Handle;
+
+  // Embedded CID/Type0 font: draw the real glyphs BY INDEX (CID=GID) using the
+  // loaded program + PDF /W advances. This is the only way to render Identity-H
+  // CID fonts with no ToUnicode (otherwise the decoded "text" is meaningless and
+  // shows as .notdef boxes). Non-rotated runs only; rotated CID falls through.
+  if (Length(E.GlyphIDs) > 0) and (Length(E.FontProgram) > 0) and (CacheIdx >= 0)
+     and (Abs(E.Matrix.B) <= 1E-3) and (Abs(E.Matrix.C) <= 1E-3) then
+  begin
+    DrawGlyphRun(Bitmap, E, X, Y, CacheIdx, DC);
+    Exit;
+  end;
+
+  S := UTF8Encode(E.Text);
   UseXf := False;
 
   // Rotated/skewed text: the text matrix has non-zero B/C (e.g. the vertical
