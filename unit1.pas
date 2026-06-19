@@ -100,6 +100,7 @@ end;
 procedure TForm1.MenuItem12Click(Sender: TObject);
 begin
   Pdf.Document.DrawRect(Pdf.CurrentPage, 20, 20, 200, 200, clRed);
+  Pdf.RefreshView;
 end;
 
 procedure TForm1.MenuItem13Click(Sender: TObject);
@@ -112,17 +113,20 @@ procedure TForm1.MenuItem14Click(Sender: TObject);
 var FontRes: AnsiString;
 begin
   FontRes := Pdf.Document.AddFont('Verdana', 40);
-  Pdf.Document.AddText(Pdf.CurrentPage, 'Hello World', 20, 20, FontRes);
+  Pdf.Document.AddText(Pdf.CurrentPage, 'Hello World', 20, 700, FontRes);
+  Pdf.RefreshView;
 end;
 
 procedure TForm1.MenuItem15Click(Sender: TObject);
 begin
   Pdf.Document.RemovePage(Pdf.CurrentPage);
+  Pdf.RefreshView;
 end;
 
 procedure TForm1.MenuItem16Click(Sender: TObject);
 begin
  Pdf.Document.AddPage(200,500);
+  Pdf.RefreshView;
 end;
 
 procedure TForm1.MenuItem18Click(Sender: TObject);
@@ -139,6 +143,7 @@ end;
 procedure TForm1.MenuItem19Click(Sender: TObject);
 begin
   Pdf.Document.RotateRight(Pdf.CurrentPage);
+  Pdf.RefreshView;  // rotation changes the document behind the viewer; rebuild cache
 end;
 
 procedure TForm1.MenuItem2Click(Sender: TObject);
@@ -167,6 +172,7 @@ end;
 procedure TForm1.MenuItem7Click(Sender: TObject);
 begin
   Pdf.Document.RotateLeft(Pdf.CurrentPage);
+  Pdf.RefreshView;  // rotation changes the document behind the viewer; rebuild cache
 end;
 
 procedure TForm1.MenuItem8Click(Sender: TObject);

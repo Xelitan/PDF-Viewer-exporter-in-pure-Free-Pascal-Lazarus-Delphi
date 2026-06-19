@@ -4928,6 +4928,8 @@ procedure TPdfDocument.AddText(PageIndex: Integer; const Text: string;
                                X, Y: Double; const FontRes: AnsiString);
 var Idx, I: Integer;
   Txt: TPdfExtraText;
+  pg: TPdfPage;
+  te: TPdfTextElement;
 begin
   if (PageIndex < 0) or (PageIndex >= FPages.Count) then Exit;
   Txt.FontName := 'Helvetica';
@@ -4939,6 +4941,7 @@ begin
       Txt.FontSize := FFontResources[I].FontSize;
       Break;
     end;
+  // Persisted edit (written into the page content on Save).
   Idx := Length(FExtraTexts[PageIndex]);
   SetLength(FExtraTexts[PageIndex], Idx + 1);
   Txt.Text    := Text;
@@ -4946,6 +4949,26 @@ begin
   Txt.Y       := Y;
   Txt.ResName := FontRes;
   FExtraTexts[PageIndex][Idx] := Txt;
+  // Live element so it renders immediately (not only after Save+reload), to match
+  // DrawRect. Non-embedded font -> the renderer substitutes the system face named
+  // by BaseFont. Y is in PDF space (origin bottom-left), on the text baseline.
+  pg := TPdfPage(FPages[PageIndex]);
+  pg.EnsureParsed;
+  te := TPdfTextElement.Create;
+  te.Text       := UnicodeString(Text);
+  te.FontName   := string(FontRes);
+  te.BaseFont   := Txt.FontName;
+  te.FontSize   := Txt.FontSize;
+  te.FillR      := 0;
+  te.FillG      := 0;
+  te.FillB      := 0;
+  te.RenderMode := 0;
+  te.Matrix     := PdfMatrixFrom(1, 0, 0, 1, X, Y);  // identity scale, translated to (X,Y)
+  te.Bounds.X1  := X;
+  te.Bounds.X2  := X;  // degenerate width -> renderer draws at the font's natural width
+  te.Bounds.Y1  := Y;
+  te.Bounds.Y2  := Y + Txt.FontSize;
+  pg.Elements.Add(te);
 end;
 
 procedure TPdfDocument.ExtractTextToFile(PageIndex: Integer; const FileName: string);

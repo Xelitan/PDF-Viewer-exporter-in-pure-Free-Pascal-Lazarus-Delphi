@@ -17,7 +17,7 @@ uses
   Classes, SysUtils, Math, Contnrs,
   LCLType, LCLIntf,
   Controls, StdCtrls, Graphics, Clipbrd, Forms, Dialogs,
-  PdfParser, PdfBitmapRenderer, PdfTypes;
+  PdfParser, PdfBitmapRenderer, PdfMarkdown, PdfTypes;
 
 const
   XELPDF_PAGE_SPACING   = 12;
@@ -85,6 +85,7 @@ type
     procedure SetAutoFit(AValue: TXelAutoFit);
     procedure ApplyAutoFit;  // recompute FScale from FAutoFit + component size
     procedure LoadText(const FileName: string);
+    procedure LoadMarkdown(const FileName: string);
     procedure LoadPdfWithPasswordPrompt(const FileName: string);
 
     // Coordinate helpers
@@ -140,7 +141,12 @@ type
     // Scroll so that PageIndex is at the top of the viewport.
     procedure ScrollToPage(PageIndex: Integer);
 
-    property CurrentPage       : Integer read GetCurrentPage;
+    // Drop cached page bitmaps and re-lay-out, then repaint. Call this after
+    // changing the document behind the viewer's back (e.g. Document.RotateRight/
+    // RotateLeft, AddText, DrawRect, RemovePage). Plain Refresh/Repaint don't
+    // help because rendered pages are cached and only rebuilt when nil.
+    procedure RefreshView;
+
     property SearchResultCount : Integer read GetSearchResultCount;
     property Scale             : Double  read FScale write SetScale;
     property Document          : TPdfDocument read FDocument;
@@ -149,6 +155,7 @@ type
     property AutoFit           : TXelAutoFit read FAutoFit write SetAutoFit;
 
   published
+    property CurrentPage       : Integer read GetCurrentPage;
     property Align;
     property Anchors;
     property Color default clDkGray;
@@ -374,6 +381,9 @@ begin
 
   if LowerCase(ExtractFileExt(FileName)) = '.txt' then
     LoadText(FileName)          // generates a PDF internally, then loads it
+  else if (LowerCase(ExtractFileExt(FileName)) = '.md') or
+          (LowerCase(ExtractFileExt(FileName)) = '.markdown') then
+    LoadMarkdown(FileName)      // converts Markdown -> PDF, then loads it
   else begin
     FIsTextFile := False;
     LoadPdfWithPasswordPrompt(FileName);
@@ -430,7 +440,7 @@ begin
   begin
     FPageOffsets[I] := Y;
     Page := TPdfPage(FDocument.Pages[I]);
-    PageH := Round(Page.Height * FScale);
+    PageH := Round(Page.EffectiveHeight * FScale);   // /Rotate-aware (swaps for 90/270)
     Inc(Y, PageH + FPageSpacing);
   end;
   FTotalHeight := Y;
@@ -481,6 +491,30 @@ begin
   ApplyAutoFit;
 end;
 
+// Force a full re-render: free every cached page bitmap so Paint rebuilds them
+// from the current document state, recompute the layout (a rotation swaps a
+// page's effective width/height) and repaint. Without this an external change
+// like Document.RotateRight is invisible, because EnsurePageBitmap keeps the
+// stale cached bitmap and only renders when the slot is nil.
+procedure TXelPDF.RefreshView;
+var
+  I, OldPage: Integer;
+begin
+  OldPage := GetCurrentPage;
+  for I := 0 to High(FPageBitmaps) do
+  begin
+    FPageBitmaps[I].Free;
+    FPageBitmaps[I] := nil;
+  end;
+  if (not FIsTextFile) and Assigned(FDocument) and (FDocument.Pages.Count > 0) then
+  begin
+    if FAutoFit <> afNone then ApplyAutoFit;  // re-fit: rotation changes page W/H
+    LayoutPages;
+    ScrollToPage(OldPage);
+  end;
+  Invalidate;
+end;
+
 // Recompute the render scale so the first page's width (afWidth) or height
 // (afHeight) matches the component. No-op for text files / afNone / no document.
 procedure TXelPDF.ApplyAutoFit;
@@ -488,8 +522,8 @@ var pageW, pageH, target: Double;
 begin
   if FIsTextFile or (FAutoFit = afNone) then Exit;
   if (not Assigned(FDocument)) or (FDocument.Pages.Count = 0) then Exit;
-  pageW := TPdfPage(FDocument.Pages[0]).Width;
-  pageH := TPdfPage(FDocument.Pages[0]).Height;
+  pageW := TPdfPage(FDocument.Pages[0]).EffectiveWidth;
+  pageH := TPdfPage(FDocument.Pages[0]).EffectiveHeight;
   target := FScale;
   case FAutoFit of
     afWidth:  if pageW > 0 then target := ContentWidth / pageW;  // fit visible width
@@ -590,8 +624,8 @@ begin
     end;
   end else begin
     Page  := TPdfPage(FDocument.Pages[PageIndex]);
-    PageW := Round(Page.Width  * FScale);
-    PageH := Round(Page.Height * FScale);
+    PageW := Round(Page.EffectiveWidth  * FScale);   // /Rotate-aware
+    PageH := Round(Page.EffectiveHeight * FScale);
   end;
   CX    := ContentWidth;
   PX    := (CX - PageW) div 2;
@@ -1114,6 +1148,28 @@ begin
     Doc.Free;
     AllLines.Free;
     SrcLines.Free;
+  end;
+end;
+
+// Convert a Markdown file to a PDF (A4) and load it. Like LoadText, the document
+// is built directly on a TPdfDocument so selection/search/copy all work.
+procedure TXelPDF.LoadMarkdown(const FileName: string);
+const PAGE_W = 595.0; PAGE_H = 842.0;
+var Doc: TPdfDocument; MS: TMemoryStream; SL: TStringList;
+begin
+  Doc := nil; MS := nil; SL := TStringList.Create;
+  try
+    SL.LoadFromFile(FileName);              // raw bytes (UTF-8 folded later)
+    Doc := TPdfDocument.Create(PAGE_W, PAGE_H);
+    BuildPdfFromMarkdown(SL.Text, Doc);
+    MS := TMemoryStream.Create;
+    Doc.SaveToStream(MS);
+    MS.Position := 0;
+    FIsTextFile := False;
+    FDocument.LoadFromStream(MS);
+    LayoutPages;
+  finally
+    MS.Free; Doc.Free; SL.Free;
   end;
 end;
 
