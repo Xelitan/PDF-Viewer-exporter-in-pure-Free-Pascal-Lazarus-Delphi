@@ -128,7 +128,8 @@ Images:
 - CCITT Group 3/4 fax images (monochrome)
 - ICCBased images (RGB, CMYK, Gray).
 - Soft-mask transparency
-
+- Lab color-space images
+  
 Embedded font formats:
 - TrueType — FontFile2
 - CFF / Type1C / CIDFontType0C / OpenType — FontFile3
@@ -138,4 +139,4 @@ Embedded font formats:
 Images:
 - JBIG2 images (monochrome)
 - JPEG 2000 / JPXDecode
-- Lab color-space images
+
