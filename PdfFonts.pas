@@ -830,6 +830,31 @@ const
     500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541
   );
 
+// Verdana glyph widths (codes 32..126), 1000-em units. Verdana is a common
+// default in printer-driver PDFs (e.g. novaPDF) that ship it as a non-embedded
+// font with NO /Widths array, trusting the viewer to have it. It is markedly
+// wider than Helvetica/Arial, so falling back to Helvetica metrics under-advances
+// the text — and because such producers position each run at an absolute Tm, the
+// shortfall shows up as visible gaps at every run boundary within a line.
+// Measured from the system Verdana face via GDI at a 1000-unit em.
+const
+  VerdanaWidths: array[32..126] of Integer = (
+    352, 394, 459, 818, 636, 1076, 727, 269, 454, 454, 636, 818, 364, 454, 364, 454,
+    636, 636, 636, 636, 636, 636, 636, 636, 636, 636, 454, 454, 818, 818, 818, 545,
+    1000, 684, 686, 698, 771, 632, 575, 775, 751, 421, 455, 693, 557, 843, 748, 787,
+    603, 787, 695, 684, 616, 732, 684, 989, 685, 615, 685, 454, 454, 454, 818, 636,
+    636, 601, 623, 521, 623, 596, 352, 623, 633, 272, 344, 592, 272, 973, 633, 607,
+    623, 623, 427, 521, 394, 633, 592, 818, 592, 592, 525, 635, 454, 635, 818
+  );
+  VerdanaBoldWidths: array[32..126] of Integer = (
+    342, 402, 587, 867, 711, 1272, 862, 332, 543, 543, 711, 867, 361, 480, 361, 689,
+    711, 711, 711, 711, 711, 711, 711, 711, 711, 711, 402, 402, 867, 867, 867, 617,
+    964, 776, 762, 724, 830, 683, 650, 811, 837, 546, 555, 771, 637, 948, 847, 850,
+    733, 850, 782, 710, 682, 812, 764, 1128, 764, 737, 692, 543, 689, 543, 867, 711,
+    711, 668, 699, 588, 699, 664, 422, 699, 712, 342, 403, 671, 342, 1058, 712, 687,
+    699, 699, 497, 593, 456, 712, 650, 980, 669, 651, 597, 711, 543, 711, 867
+  );
+
 function StandardType1Width(const BF: string; Code: Integer): Double;
 var
   Upper: string;
@@ -840,7 +865,12 @@ begin
     Exit;
   end;
   Upper := UpperCase(BF);
-  if (Pos('ARIAL', Upper) > 0) or (Pos('HELVETICA', Upper) > 0) then
+  if (Pos('VERDANA', Upper) > 0) then
+  begin
+    if Pos('BOLD', Upper) > 0 then Result := VerdanaBoldWidths[Code]
+    else Result := VerdanaWidths[Code];
+  end
+  else if (Pos('ARIAL', Upper) > 0) or (Pos('HELVETICA', Upper) > 0) then
     Result := HelveticaWidths[Code]
   else if (Pos('TIMES', Upper) > 0) then
     Result := TimesRomanWidths[Code]

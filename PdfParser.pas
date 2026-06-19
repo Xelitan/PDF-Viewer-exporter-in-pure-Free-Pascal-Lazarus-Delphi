@@ -70,6 +70,11 @@ type
     // Character i occupies X range [Bounds.X1 + sum(CharWidths[0..i-1]),
     // Bounds.X1 + sum(CharWidths[0..i])].
     CharWidths: array of Double;
+    // For embedded CID/Type0 fonts rendered by glyph index: the glyph IDs (CIDs,
+    // = GIDs for Identity) and their PAGE-space advances (the renderer scales to
+    // device). Empty for normal text.
+    GlyphIDs: array of Word;
+    GlyphAdv: array of Double;
     constructor Create;
   end;
 
@@ -1880,10 +1885,34 @@ begin
       end;
       // The FontDescriptor and its FontFile streams are usually INDIRECT refs that
       // LoadFromDictionary can't dereference itself, so the embedded program never
-      // reached the font. Resolve them here for simple fonts (Type1/TrueType). For
-      // Type0 the descriptor is on the descendant — left to substitution for now.
+      // reached the font. Resolve them here. Simple fonts: descriptor on the font
+      // dict. Type0/CID: descriptor on the descendant font — fetch it too so the
+      // embedded CID program can be rendered by glyph index.
       DescObj := ResolveObject(TPdfDictionaryObject(FontObj).Get('FontDescriptor'));
-      if DescObj is TPdfDictionaryObject then
+      if (not (DescObj is TPdfDictionaryObject)) and Font.IsCIDFont then
+      begin
+        DescFontsObj := ResolveObject(TPdfDictionaryObject(FontObj).Get('DescendantFonts'));
+        if (DescFontsObj is TPdfArrayObject) and (TPdfArrayObject(DescFontsObj).Items.Count > 0) then
+          DescFontsObj := ResolveObject(TPdfObject(TPdfArrayObject(DescFontsObj).Items[0]));
+        if DescFontsObj is TPdfDictionaryObject then
+          DescObj := ResolveObject(TPdfDictionaryObject(DescFontsObj).Get('FontDescriptor'));
+      end;
+      if (DescObj is TPdfDictionaryObject) and Font.IsCIDFont then
+      begin
+        // CID font: load the raw embedded program (CIDFontType2 TrueType or
+        // CIDFontType0C/OpenType CFF). It is rendered BY GLYPH INDEX (CID=GID for
+        // Identity), so no Unicode-cmap composition is needed.
+        FFObj := ResolveObject(TPdfDictionaryObject(DescObj).Get('FontFile2'));
+        if FFObj is TPdfStreamObject then
+          Font.SetFontProgramBytes(fpkTrueType, TPdfStreamObject(FFObj).DecodedData)
+        else
+        begin
+          FFObj := ResolveObject(TPdfDictionaryObject(DescObj).Get('FontFile3'));
+          if FFObj is TPdfStreamObject then
+            Font.SetFontProgramBytes(fpkCFF, TPdfStreamObject(FFObj).DecodedData);
+        end;
+      end
+      else if DescObj is TPdfDictionaryObject then
       begin
         FFObj := ResolveObject(TPdfDictionaryObject(DescObj).Get('FontFile2'));
         if FFObj is TPdfStreamObject then
@@ -3080,6 +3109,14 @@ var S: AnsiString;
       // in the descendant /W array. Iterating per byte (the generic multi-byte
       // path) double-counts and uses the default width, marching text off the
       // line. Word spacing (Tw) applies only to single-byte code 32, so skip it.
+      // When the embedded CID program is available we also record the per-glyph
+      // IDs (CID=GID for Identity) and device advances so the renderer can draw the
+      // real glyphs by index (ExtTextOut ETO_GLYPH_INDEX) instead of substituting.
+      if Length(F.FontProgram) > 0 then
+      begin
+        SetLength(E.GlyphIDs, RawLen div 2 + 1);
+        SetLength(E.GlyphAdv, RawLen div 2 + 1);
+      end;
       I := 1;
       while I <= RawLen do
       begin
@@ -3087,8 +3124,18 @@ var S: AnsiString;
         CA := F.WidthOfCode(CID) / 1000.0 * GS.Current.FontSize
               * (GS.Current.HorizontalScaling / 100.0);
         CA := CA + GS.Current.CharSpacing;
+        if Length(F.FontProgram) > 0 then
+        begin
+          E.GlyphIDs[(I-1) div 2] := Word(CID);
+          E.GlyphAdv[(I-1) div 2] := CA * ScaleA;   // page-space advance
+        end;
         Adv := Adv + CA;
         Inc(I, 2);
+      end;
+      if Length(F.FontProgram) > 0 then
+      begin
+        SetLength(E.GlyphIDs, (RawLen + 1) div 2);
+        SetLength(E.GlyphAdv, (RawLen + 1) div 2);
       end;
       if TextLen > 0 then
         for I := 0 to TextLen - 1 do
@@ -3507,6 +3554,7 @@ var T: string;
   O1,O2,O3,O4,O5,O6: TPdfObject;
     ArrI: Integer;
     CatStr: AnsiString;
+    tjDisp: Double;
     ArrObj: TPdfArrayObject;
     ErrCode: Integer;
     ImgE: TPdfImageElement;
@@ -3647,17 +3695,26 @@ begin
           ShowText(ObjStr(O1));
           O1.Free;
         end
-        // TJ: array of strings (text) and numbers (kerning adjustments)
+        // TJ: array of strings (text) and numbers (position adjustments). Each
+        // string is shown as its own run (which advances the text matrix); each
+        // number displaces the text position by -n/1000 * Tfs * Th in text space.
+        // Applying the numbers is essential: producers use large adjustments to
+        // space items across a line (e.g. centred table headers "Accuracy" and
+        // "Hysteresis"); concatenating and ignoring them collapses them together.
         else if T='TJ' then begin
           O1 := PopObj;
-          if O1 is TPdfArrayObject then begin
-            CatStr := '';
+          if O1 is TPdfArrayObject then
             for ArrI := 0 to TPdfArrayObject(O1).Items.Count - 1 do begin
               O2 := TPdfObject(TPdfArrayObject(O1).Items[ArrI]);
-              if O2.Kind = pokString then CatStr := CatStr + O2.AsString;
+              if O2.Kind = pokString then
+                ShowText(O2.AsString)
+              else if O2.Kind in [pokInteger, pokReal] then begin
+                tjDisp := -O2.AsNumber / 1000.0 * GS.Current.FontSize
+                          * (GS.Current.HorizontalScaling / 100.0);
+                GS.Current.TextMatrix :=
+                  PdfMatrixMultiply(PdfMatrixTranslate(tjDisp, 0), GS.Current.TextMatrix);
+              end;
             end;
-            ShowText(CatStr);
-          end;
           O1.Free;
         end
         // ' operator: move to next line and show text

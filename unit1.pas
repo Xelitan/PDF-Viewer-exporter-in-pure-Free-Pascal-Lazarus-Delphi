@@ -43,8 +43,14 @@ type
     procedure FormClose(Sender: TObject; var CloseAction: TCloseAction);
     procedure FormCreate(Sender: TObject);
     procedure MenuItem10Click(Sender: TObject);
+    procedure MenuItem12Click(Sender: TObject);
+    procedure MenuItem13Click(Sender: TObject);
+    procedure MenuItem14Click(Sender: TObject);
+    procedure MenuItem15Click(Sender: TObject);
+    procedure MenuItem16Click(Sender: TObject);
     procedure MenuItem18Click(Sender: TObject);
     procedure MenuItem19Click(Sender: TObject);
+    procedure MenuItem2Click(Sender: TObject);
     procedure MenuItem3Click(Sender: TObject);
     procedure MenuItem4Click(Sender: TObject);
     procedure MenuItem5Click(Sender: TObject);
@@ -82,13 +88,41 @@ begin
   Pdf.Align := alClient;
   PDf.AutoFit := afWidth;
 
-  Pdf.LoadFromFile('google-doc-document.pdf');
+  Pdf.LoadFromFile('2112.pdf');
 
 end;
 
 procedure TForm1.MenuItem10Click(Sender: TObject);
 begin
 
+end;
+
+procedure TForm1.MenuItem12Click(Sender: TObject);
+begin
+  Pdf.Document.DrawRect(Pdf.CurrentPage, 20, 20, 200, 200, clRed);
+end;
+
+procedure TForm1.MenuItem13Click(Sender: TObject);
+var Jpeg: TBytes;
+begin
+  //Pdf.Document.AddJpegImage(Pdf.CurrentPage, Jpeg, 20, 20, 200, 200);
+end;
+
+procedure TForm1.MenuItem14Click(Sender: TObject);
+var FontRes: AnsiString;
+begin
+  FontRes := Pdf.Document.AddFont('Verdana', 40);
+  Pdf.Document.AddText(Pdf.CurrentPage, 'Hello World', 20, 20, FontRes);
+end;
+
+procedure TForm1.MenuItem15Click(Sender: TObject);
+begin
+  Pdf.Document.RemovePage(Pdf.CurrentPage);
+end;
+
+procedure TForm1.MenuItem16Click(Sender: TObject);
+begin
+ Pdf.Document.AddPage(200,500);
 end;
 
 procedure TForm1.MenuItem18Click(Sender: TObject);
@@ -105,6 +139,12 @@ end;
 procedure TForm1.MenuItem19Click(Sender: TObject);
 begin
   Pdf.Document.RotateRight(Pdf.CurrentPage);
+end;
+
+procedure TForm1.MenuItem2Click(Sender: TObject);
+begin
+  if not OpenDialog1.Execute then Exit;
+  Pdf.Document.LoadFromFile(OpenDialog1.Filename);
 end;
 
 procedure TForm1.MenuItem3Click(Sender: TObject);
