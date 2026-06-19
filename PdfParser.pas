@@ -86,6 +86,10 @@ type
     BitsPerComponent: Integer;  // samples per component (1,2,4,8); default 8
     Palette: TPdfBytes;  // for Indexed: expanded RGB triples (3*(hival+1) bytes)
     PaletteCount: Integer;  // number of palette entries (hival+1)
+    // For the /Lab colour space: the a*/b* component ranges [aMin aMax bMin bMax]
+    // (default [-100 100 -100 100]) and the illuminant white point XYZ (default D50).
+    LabRange: array[0..3] of Double;
+    LabWhite: array[0..2] of Double;
     Data: TPdfBytes;
     // Per-pixel alpha from the image's /SMask (Width*Height bytes, 255=opaque),
     // or empty if the image is fully opaque. Gives PNG-style transparency.
@@ -335,6 +339,7 @@ type
     procedure ParseAnnotations(Page: TPdfPage; PageDict: TPdfDictionaryObject);
     procedure InterpretContent(Page: TPdfPage; const Bytes: TPdfBytes; Resources: TPdfDictionaryObject; const InitialCTM: TPdfMatrix; InitialSoftMask: TObject = nil; InitialMark: Integer = -1);
     function BuildIndexedRGBPalette(CSArr: TPdfArrayObject; out Pal: TPdfBytes): Integer;
+    procedure ParseLabColorSpace(CSArr: TPdfArrayObject; var Range: array of Double; var White: array of Double);
     function BuildFunction(Obj: TPdfObject): TPdfFunction;
     function BuildShading(ShadingObj: TPdfObject; const ACTM: TPdfMatrix): TPdfShadingElement;
     function BuildSoftMask(Page: TPdfPage; SMaskDict: TPdfDictionaryObject; const ACTM: TPdfMatrix): TPdfSoftMask;
@@ -423,9 +428,109 @@ type
     property Pages: TObjectList read FPages;
   end;
 
+// Decode a CIE 1976 L*a*b* image (3 components, Bpc bits each) into packed RGB
+// triples (W*H*3 bytes). Range = [aMin aMax bMin bMax]; Xw/Yw/Zw = white point.
+// Shared by the on-screen renderer and the PNG exporter. Returns False on a size
+// mismatch (RGB is then left empty).
+function PdfDecodeLabToRGB(const Data: TPdfBytes; W, H, Bpc: Integer;
+  const Range: array of Double; Xw, Yw, Zw: Double; out RGB: TPdfBytes): Boolean;
+
 implementation
 
 uses PdfCFF, PdfBitmapRenderer, PdfJpeg, PdfCcitt, FPImage, FPWriteJPEG;  // added-API helpers
+
+function PdfDecodeLabToRGB(const Data: TPdfBytes; W, H, Bpc: Integer;
+  const Range: array of Double; Xw, Yw, Zw: Double; out RGB: TPdfBytes): Boolean;
+  // f^-1 of the CIE L*a*b* companding function.
+  function FInv(t: Double): Double;
+  begin
+    if t*t*t > 0.008856 then Result := t*t*t
+    else Result := (t - 16.0/116.0) / 7.787;
+  end;
+  // Linear-light -> sRGB gamma, clamped to a 0..255 byte.
+  function Enc(c: Double): Integer;
+  begin
+    if c <= 0.0 then begin Result := 0; Exit; end;
+    if c >= 1.0 then begin Result := 255; Exit; end;
+    if c <= 0.0031308 then c := 12.92*c
+    else c := 1.055*Power(c, 1.0/2.4) - 0.055;
+    Result := EnsureRange(Round(c*255.0), 0, 255);
+  end;
+var
+  x, y, comp: Integer;
+  stride, bitpos, bytepos, shift, mask, maxv, smp: Integer;
+  samp: array[0..2] of Integer;
+  aMin, aMax, bMin, bMax, LL, AA, BB, fy, fx, fz, cX, cY, cZ, r, g, b: Double;
+  o: Integer;
+  m: array[0..8] of Double;  // XYZ -> linear sRGB matrix, chosen by white point
+begin
+  Result := False;
+  RGB := nil;
+  if (W <= 0) or (H <= 0) then Exit;
+  if Bpc <= 0 then Bpc := 8;
+  // 3 components per pixel, packed MSB-first within each row (rows byte-aligned).
+  stride := (W*3*Bpc + 7) div 8;
+  if Length(Data) < stride*H then Exit;
+  maxv := (1 shl Bpc) - 1;
+  if maxv = 0 then maxv := 1;
+  mask := maxv;
+  aMin := -100; aMax := 100; bMin := -100; bMax := 100;
+  if Length(Range) >= 4 then
+  begin
+    aMin := Range[0]; aMax := Range[1]; bMin := Range[2]; bMax := Range[3];
+  end;
+  // XYZ -> linear sRGB depends on the reference white. sRGB is defined for D65;
+  // PDF /Lab is usually D50. Pick by the white point (D50 Zw~0.82, D65 Zw~1.09):
+  // for D65 use the standard sRGB matrix, otherwise the Bradford-adapted D50 one.
+  if Zw > 0.95 then
+  begin                          // D65
+    m[0] :=  3.2406; m[1] := -1.5372; m[2] := -0.4986;
+    m[3] := -0.9689; m[4] :=  1.8758; m[5] :=  0.0415;
+    m[6] :=  0.0557; m[7] := -0.2040; m[8] :=  1.0570;
+  end
+  else
+  begin                          // D50 (Bradford-adapted)
+    m[0] :=  3.1338561; m[1] := -1.6168667; m[2] := -0.4906146;
+    m[3] := -0.9787684; m[4] :=  1.9161415; m[5] :=  0.0334540;
+    m[6] :=  0.0719453; m[7] := -0.2289914; m[8] :=  1.4052427;
+  end;
+  SetLength(RGB, W*H*3);
+  for y := 0 to H-1 do
+    for x := 0 to W-1 do
+    begin
+      for comp := 0 to 2 do
+      begin
+        if Bpc = 8 then
+          smp := Data[y*stride + (x*3 + comp)]
+        else
+        begin
+          bitpos := (x*3 + comp) * Bpc;
+          bytepos := y*stride + (bitpos div 8);
+          shift := 8 - Bpc - (bitpos mod 8);
+          smp := (Data[bytepos] shr shift) and mask;
+        end;
+        samp[comp] := smp;
+      end;
+      LL := samp[0] / maxv * 100.0;
+      AA := aMin + samp[1] / maxv * (aMax - aMin);
+      BB := bMin + samp[2] / maxv * (bMax - bMin);
+      // L*a*b* -> XYZ (white point Xw/Yw/Zw).
+      fy := (LL + 16.0) / 116.0;
+      fx := fy + AA/500.0;
+      fz := fy - BB/200.0;
+      cX := Xw * FInv(fx);
+      cY := Yw * FInv(fy);
+      cZ := Zw * FInv(fz);
+      r := m[0]*cX + m[1]*cY + m[2]*cZ;
+      g := m[3]*cX + m[4]*cY + m[5]*cZ;
+      b := m[6]*cX + m[7]*cY + m[8]*cZ;
+      o := (y*W + x)*3;
+      RGB[o+0] := Enc(r);
+      RGB[o+1] := Enc(g);
+      RGB[o+2] := Enc(b);
+    end;
+  Result := True;
+end;
 
 function IsWhite(C: Byte): Boolean;
 begin
@@ -769,6 +874,9 @@ begin
   Kind := AKind;
   Matrix := PdfIdentityMatrix;
   BitsPerComponent := 8;
+  // /Lab defaults (overwritten by ParseLabColorSpace when the image is Lab).
+  LabRange[0] := -100; LabRange[1] := 100; LabRange[2] := -100; LabRange[3] := 100;
+  LabWhite[0] := 0.9642; LabWhite[1] := 1.0; LabWhite[2] := 0.8249;  // CIE D50
 end;
 constructor TPdfUnknownElement.Create(const Op: string);
 begin
@@ -2690,6 +2798,8 @@ var BaseObj, HiObj, LookObj, ICCStm: TPdfObject;
     LS: AnsiString;
     c, m, y, k: Integer;
     rr, gg, bb: Integer;
+    labR: array[0..3] of Double;
+    labW: array[0..2] of Double;
 begin
   Result := 0;
   Pal := nil;
@@ -2737,6 +2847,13 @@ begin
             NComps := 3;
           end;
         end;
+      end
+      else if (TPdfArrayObject(BaseObj).Items.Count >= 1) and
+              SameText(TPdfObject(TPdfArrayObject(BaseObj).Items[0]).AsName, 'Lab') then
+      begin
+        BaseKind := 'LAB';
+        NComps := 3;
+        ParseLabColorSpace(TPdfArrayObject(BaseObj), labR, labW);
       end;
     end;
   end;
@@ -2752,6 +2869,15 @@ begin
     for I := 1 to Length(LS) do Lookup[I-1] := Byte(LS[I]);
   end;
   if Length(Lookup) < (HiVal+1) * NComps then Exit;
+
+  // Lab base: the lookup holds 8-bit L*a*b* triples — decode the whole table as a
+  // 1-row image straight into the RGB palette.
+  if BaseKind = 'LAB' then
+  begin
+    if PdfDecodeLabToRGB(Lookup, HiVal+1, 1, 8, labR, labW[0], labW[1], labW[2], Pal) then
+      Result := HiVal + 1;
+    Exit;
+  end;
 
   SetLength(Pal, (HiVal+1) * 3);
   for Idx := 0 to HiVal do
@@ -2783,6 +2909,33 @@ begin
     Pal[Idx*3+2] := Byte(bb);
   end;
   Result := HiVal + 1;
+end;
+
+// Read the parameters of a [/Lab << /WhitePoint [Xw Yw Zw] /Range [a0 a1 b0 b1] >>]
+// colour space into Range (a/b extents, default [-100 100 -100 100]) and White (the
+// illuminant XYZ, default D50). Either dict entry may be absent.
+procedure TPdfDocument.ParseLabColorSpace(CSArr: TPdfArrayObject;
+  var Range: array of Double; var White: array of Double);
+var Dict, O: TPdfObject; Arr: TPdfArrayObject; I: Integer;
+begin
+  // Defaults.
+  Range[0] := -100; Range[1] := 100; Range[2] := -100; Range[3] := 100;
+  White[0] := 0.9642; White[1] := 1.0; White[2] := 0.8249;  // CIE D50
+  if CSArr.Items.Count < 2 then Exit;
+  Dict := ResolveObject(TPdfObject(CSArr.Items[1]));
+  if not (Dict is TPdfDictionaryObject) then Exit;
+  O := ResolveObject(TPdfDictionaryObject(Dict).Get('WhitePoint'));
+  if (O is TPdfArrayObject) and (TPdfArrayObject(O).Items.Count >= 3) then
+  begin
+    Arr := TPdfArrayObject(O);
+    for I := 0 to 2 do White[I] := TPdfObject(Arr.Items[I]).AsNumber;
+  end;
+  O := ResolveObject(TPdfDictionaryObject(Dict).Get('Range'));
+  if (O is TPdfArrayObject) and (TPdfArrayObject(O).Items.Count >= 4) then
+  begin
+    Arr := TPdfArrayObject(O);
+    for I := 0 to 3 do Range[I] := TPdfObject(Arr.Items[I]).AsNumber;
+  end;
 end;
 
 procedure TPdfDocument.InterpretContent(Page: TPdfPage; const Bytes: TPdfBytes; Resources: TPdfDictionaryObject; const InitialCTM: TPdfMatrix; InitialSoftMask: TObject = nil; InitialMark: Integer = -1);
@@ -3786,7 +3939,9 @@ begin
                         begin
                           ImgE.ColorSpace := 'Indexed';
                           ImgE.PaletteCount := BuildIndexedRGBPalette(TPdfArrayObject(O4), ImgE.Palette);
-                        end;
+                        end
+                        else if SameText(ImgE.ColorSpace, 'Lab') then
+                          ParseLabColorSpace(TPdfArrayObject(O4), ImgE.LabRange, ImgE.LabWhite);
                       end;
                     end;
                     ImgE.Data := TPdfStreamObject(O3).DecodedData;
@@ -5369,6 +5524,9 @@ begin
     end;
     Result := True;
   end
+  else if SameText(cs,'Lab') then
+    Result := PdfDecodeLabToRGB(E.Data, W, H, bpc, E.LabRange,
+                                E.LabWhite[0], E.LabWhite[1], E.LabWhite[2], RGB)
   else // DeviceGray / CalGray / unspecified
   begin
     stride := (W*bpc+7) div 8;

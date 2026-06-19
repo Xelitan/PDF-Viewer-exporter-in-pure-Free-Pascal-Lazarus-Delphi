@@ -55,6 +55,7 @@ type
     procedure DrawRawDeviceRGB(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawRawDeviceCMYK(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawIndexedImage(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
+    procedure DrawRawLab(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawJpegImage(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawPathElement(Bitmap: TBitmap; Page: TPdfPage; E: TPdfPathElement);
     function DrawPathGdiPlus(Bitmap: TBitmap; Page: TPdfPage; E: TPdfPathElement): Boolean;
@@ -1117,6 +1118,41 @@ begin
   end;
 end;
 
+procedure TPdfBitmapRenderer.DrawRawLab(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
+var
+  TmpBmp: TBitmap;
+  RGB: TPdfBytes;
+  Y, X, o: Integer;
+  Dst: PByte;
+begin
+  // Convert the L*a*b* samples to packed RGB via the shared decoder, then blit.
+  if not PdfDecodeLabToRGB(E.Data, E.Width, E.Height, E.BitsPerComponent,
+       E.LabRange, E.LabWhite[0], E.LabWhite[1], E.LabWhite[2], RGB) then
+  begin
+    DrawPlaceholder(Bitmap, R, E.Name);
+    Exit;
+  end;
+  TmpBmp := TBitmap.Create;
+  try
+    TmpBmp.PixelFormat := pf24bit;
+    TmpBmp.SetSize(E.Width, E.Height);
+    for Y := 0 to E.Height - 1 do
+    begin
+      Dst := TmpBmp.ScanLine[Y];
+      for X := 0 to E.Width - 1 do
+      begin
+        o := (Y*E.Width + X)*3;
+        Dst[X*3+0] := RGB[o+2];  // B
+        Dst[X*3+1] := RGB[o+1];  // G
+        Dst[X*3+2] := RGB[o+0];  // R
+      end;
+    end;
+    DrawBitmapScaled(Bitmap, R, TmpBmp);
+  finally
+    TmpBmp.Free;
+  end;
+end;
+
 // Draw a vector path with GDI+ antialiasing. Returns False if GDI+ is
 // unavailable or fails, so the caller falls back to the plain-GDI path code.
 function TPdfBitmapRenderer.DrawPathGdiPlus(Bitmap: TBitmap; Page: TPdfPage; E: TPdfPathElement): Boolean;
@@ -1738,6 +1774,8 @@ begin
     DrawRawDeviceRGB(Bitmap, R, E)
   else if SameText(CS, 'DeviceCMYK') then
     DrawRawDeviceCMYK(Bitmap, R, E)
+  else if SameText(CS, 'Lab') then
+    DrawRawLab(Bitmap, R, E)
   else if SameText(CS, 'DeviceGray') or SameText(CS, 'CalGray') then
     DrawRawDeviceGray(Bitmap, R, E)
   else
