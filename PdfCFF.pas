@@ -20,9 +20,16 @@ unit PdfCFF;
 
 interface
 
-uses SysUtils, Classes, PdfTypes;
+uses SysUtils, Classes, Types, PdfTypes;
 
-function WrapCFFToOTF(const CFF: TPdfBytes; const FamilyName: AnsiString): TPdfBytes;
+function WrapCFFToOTF(const CFF0: TPdfBytes; const FamilyName: AnsiString): TPdfBytes;
+// Convert a CID-keyed CFF to a plain (name-keyed) CFF, preserving CharStrings/GID
+// order. Returns nil if the font is not CID-keyed or can't be converted.
+function CIDCFFToPlain(const CFF: TPdfBytes): TPdfBytes;
+// For a CID-keyed CFF, return a CID->GID lookup parsed from the CFF charset
+// (Result[CID] = GID; Result[0]=0). Empty if the CFF is not CID-keyed. Used to
+// render Type0/Identity-H text by glyph index (CID alone is not the GID).
+function CFFCidToGid(const CFF: TPdfBytes): TWordDynArray;
 // Add a minimal cmap and/or post table to a TrueType/OpenType font that lacks
 // them (common in PDF-embedded subsets) so Windows can open/install it.
 function EnsureFontTables(const Font: TPdfBytes): TPdfBytes;
@@ -491,8 +498,93 @@ begin
     end;
 end;
 
-function WrapCFFToOTF(const CFF: TPdfBytes; const FamilyName: AnsiString): TPdfBytes;
+// Convert a CID-keyed CFF (has ROS) into an equivalent plain (name-keyed) CFF.
+// GDI mis-renders hand-wrapped CID-keyed CFFs (it can't resolve the per-FD Private
+// for charstring width/hint parsing → partial glyph outlines), but renders plain
+// CFFs correctly. We keep the CharStrings INDEX verbatim (so GID order — and thus
+// the CID→GID charset map — is preserved) and give the font a top-level Private
+// taken from FD0, dropping ROS/FDArray/FDSelect. Returns nil if it can't (e.g. the
+// FD has its own local Subrs, which a top-level Private can't reference here).
+function CIDCFFToPlain(const CFF: TPdfBytes): TPdfBytes;
 var
+  hdrSize: Integer;
+  nameIdx, topIdx, strIdx, gsubrIdx, csIdx, fdIdx: TIndex;
+  topDict, fd0: TDict;
+  csOff, fdaOff, privSz, privOff: Integer;
+  nameBytes, gsubrBytes, csBytes, privBytes, td: TPdfBytes;
+  ms, top: TMemoryStream;
+  newCsOff, newPrivOff, pos0, i: Integer;
+
+  procedure DI5(S: TStream; V: LongWord);  // DICT int operand as 5-byte (29 + int32)
+  begin W8(S,29); W8(S,(V shr 24)and$FF); W8(S,(V shr 16)and$FF); W8(S,(V shr 8)and$FF); W8(S,V and$FF); end;
+  procedure WOff(S: TStream; V, sz: Integer);
+  var b: Integer;
+  begin for b := sz-1 downto 0 do W8(S, (V shr (b*8)) and $FF); end;
+  procedure WrIndex1(S: TStream; const D: TPdfBytes);  // single-item INDEX
+  begin W16(S,1); W8(S,2); WOff(S,1,2); WOff(S,1+Length(D),2); if Length(D)>0 then S.WriteBuffer(D[0],Length(D)); end;
+begin
+  Result := nil;
+  if (Length(CFF) < 4) or (RdU8(CFF,0) <> 1) then Exit;
+  hdrSize := RdU8(CFF,2);
+  nameIdx  := ReadIndex(CFF, hdrSize);
+  topIdx   := ReadIndex(CFF, nameIdx.EndPos);
+  strIdx   := ReadIndex(CFF, topIdx.EndPos);
+  gsubrIdx := ReadIndex(CFF, strIdx.EndPos);
+  if topIdx.Count < 1 then Exit;
+  topDict := ParseDict(IndexObj(CFF, topIdx, 0));
+  if not DictHas(topDict, 1230) then Exit;        // not CID — caller wraps as-is
+  csOff := Round(DictGet(topDict, 17, 0, 0));
+  fdaOff := Round(DictGet(topDict, 1236, 0, 0));   // FDArray
+  if (csOff <= 0) or (fdaOff <= 0) then Exit;
+  csIdx := ReadIndex(CFF, csOff);
+  if csIdx.Count < 1 then Exit;
+  fdIdx := ReadIndex(CFF, fdaOff);
+  if fdIdx.Count < 1 then Exit;
+  fd0 := ParseDict(IndexObj(CFF, fdIdx, 0));        // use FD0's Private for all glyphs
+  privSz := Round(DictGet(fd0, 18, 0, 0));
+  privOff := Round(DictGet(fd0, 18, 1, 0));
+  if (privSz <= 0) or (privOff <= 0) or (privOff+privSz > Length(CFF)) then Exit;
+  privBytes := Copy(CFF, privOff, privSz);
+  // Bail if the Private references local Subrs (op 19) — they'd need relocation.
+  if DictHas(ParseDict(privBytes), 19) then Exit;
+
+  nameBytes  := Copy(CFF, hdrSize, nameIdx.EndPos - hdrSize);
+  gsubrBytes := Copy(CFF, strIdx.EndPos, gsubrIdx.EndPos - strIdx.EndPos);
+  csBytes    := Copy(CFF, csOff, csIdx.EndPos - csOff);
+
+  // Lay out: header(4) name topINDEX strINDEX(empty,2) gsubr charstrings private.
+  // The top dict uses fixed 5-byte ints, so its size is constant (17 bytes); the
+  // single-item top INDEX is 7(hdr: count2+offSize1+2 offsets*2) + 17 = 24 bytes,
+  // letting us compute the charstrings/private offsets directly.
+  pos0 := 4 + Length(nameBytes) + 24 + 2 + Length(gsubrBytes);
+  newCsOff := pos0;
+  newPrivOff := pos0 + Length(csBytes);
+
+  ms := TMemoryStream.Create;
+  top := TMemoryStream.Create;
+  try
+    DI5(top, LongWord(privSz)); DI5(top, LongWord(newPrivOff)); W8(top, 18);  // Private
+    DI5(top, LongWord(newCsOff)); W8(top, 17);                                // CharStrings
+    SetLength(td, top.Size); if top.Size > 0 then Move(top.Memory^, td[0], top.Size);
+
+    W8(ms,1); W8(ms,0); W8(ms,4); W8(ms,2);                 // header: ver1, hdrSize4, offSize2
+    if Length(nameBytes) > 0 then ms.WriteBuffer(nameBytes[0], Length(nameBytes));
+    WrIndex1(ms, td);                                       // top INDEX (must be 22 bytes)
+    W16(ms, 0);                                             // empty String INDEX
+    if Length(gsubrBytes) > 0 then ms.WriteBuffer(gsubrBytes[0], Length(gsubrBytes));
+    if Length(csBytes) > 0 then ms.WriteBuffer(csBytes[0], Length(csBytes));
+    if Length(privBytes) > 0 then ms.WriteBuffer(privBytes[0], Length(privBytes));
+    SetLength(Result, ms.Size);
+    if ms.Size > 0 then Move(ms.Memory^, Result[0], ms.Size);
+  finally
+    top.Free; ms.Free;
+  end;
+end;
+
+function WrapCFFToOTF(const CFF0: TPdfBytes; const FamilyName: AnsiString): TPdfBytes;
+var
+  CFF: TPdfBytes;
+  plain: TPdfBytes;
   hdrSize: Integer;
   nameIdx, topIdx, strIdx, csIdx: TIndex;
   topDict, privDict: TDict;
@@ -517,10 +609,17 @@ var
   savedPos: Int64;
   so: TPdfBytes;
   m, uni: Integer;
+  isCID: Boolean;
 begin
   Result := nil;
+  CFF := CFF0;
   if Length(CFF) < 4 then Exit;
   if RdU8(CFF,0) <> 1 then Exit;
+  // CID-keyed CFF: GDI mis-renders it (partial outlines). Convert to a plain CFF
+  // first — same CharStrings/GID order, so the CID→GID map still applies — and wrap
+  // that. CIDCFFToPlain returns nil for non-CID fonts (then we wrap CFF as-is).
+  plain := CIDCFFToPlain(CFF);
+  if Length(plain) > 0 then CFF := plain;
   hdrSize := RdU8(CFF,2);
   if (hdrSize < 4) or (hdrSize > Length(CFF)) then Exit;
 
@@ -530,7 +629,7 @@ begin
   if topIdx.Count < 1 then Exit;
 
   topDict := ParseDict(IndexObj(CFF, topIdx, 0));
-  if DictHas(topDict, 1230) then Exit;  // ROS -> CIDFont
+  isCID := DictHas(topDict, 1230);   // false after conversion; true only if convert failed
   csOff := Round(DictGet(topDict, 17, 0, 0));
   charsetOff := Round(DictGet(topDict, 15, 0, 0));
   if csOff <= 0 then Exit;
@@ -559,8 +658,44 @@ begin
   SetLength(uniToGid, $10000);
   for i := 0 to High(uniToGid) do uniToGid[i] := -1;
 
-  // charset: GID -> SID -> Unicode
-  if charsetOff > 2 then
+  // charset: GID -> SID -> Unicode  (skipped for CID fonts: their charset maps
+  // GID->CID, not glyph names, so no usable Unicode cmap — glyph-index rendering).
+  if isCID then
+  begin
+    // CID-keyed CFF: the charset maps GID -> CID (not glyph names). Build a (3,1)
+    // cmap that maps the CID (as a codepoint) -> GID, so the caller can render by
+    // passing CIDs as characters and GDI resolves them to the correct glyphs.
+    if charsetOff > 2 then
+    begin
+      fmt := RdU8(CFF, charsetOff);
+      g := 1;
+      i := charsetOff + 1;
+      if fmt = 0 then
+        while (g < numGlyphs) and (i+1 < Length(CFF)) do
+        begin
+          sid := RdU16(CFF, i); Inc(i,2);          // sid is actually the CID here
+          if sid <= $FFFF then uniToGid[sid] := g;
+          Inc(g);
+        end
+      else if (fmt = 1) or (fmt = 2) then
+        while (g < numGlyphs) and (i < Length(CFF)) do
+        begin
+          first := RdU16(CFF, i); Inc(i,2);
+          if fmt = 1 then begin nLeft := RdU8(CFF,i); Inc(i); end
+          else begin nLeft := RdU16(CFF,i); Inc(i,2); end;
+          for k := 0 to nLeft do
+          begin
+            if g >= numGlyphs then Break;
+            if (first + k) <= $FFFF then uniToGid[first + k] := g;
+            Inc(g);
+          end;
+        end;
+    end
+    else
+      // Identity charset (rare): CID = GID.
+      for g := 1 to numGlyphs - 1 do uniToGid[g] := g;
+  end
+  else if charsetOff > 2 then
   begin
     fmt := RdU8(CFF, charsetOff);
     g := 1;
@@ -878,6 +1013,64 @@ begin
     postT.Free;
     out_.Free;
   end;
+end;
+
+function CFFCidToGid(const CFF: TPdfBytes): TWordDynArray;
+var
+  hdrSize, csOff, charsetOff, numGlyphs, fmt, g, i, first, nLeft, k, cid, maxCid: Integer;
+  nameIdx, topIdx, csIdx: TIndex;
+  topDict: TDict;
+begin
+  Result := nil;
+  if Length(CFF) < 4 then Exit;
+  if RdU8(CFF,0) <> 1 then Exit;
+  hdrSize := RdU8(CFF,2);
+  if (hdrSize < 4) or (hdrSize > Length(CFF)) then Exit;
+  nameIdx := ReadIndex(CFF, hdrSize);
+  topIdx  := ReadIndex(CFF, nameIdx.EndPos);
+  if topIdx.Count < 1 then Exit;
+  topDict := ParseDict(IndexObj(CFF, topIdx, 0));
+  if not DictHas(topDict, 1230) then Exit;            // not CID-keyed
+  csOff := Round(DictGet(topDict, 17, 0, 0));         // CharStrings
+  charsetOff := Round(DictGet(topDict, 15, 0, 0));    // charset
+  if csOff <= 0 then Exit;
+  csIdx := ReadIndex(CFF, csOff);
+  numGlyphs := csIdx.Count;
+  if (numGlyphs < 1) or (numGlyphs > 65535) then Exit;
+
+  SetLength(Result, 65536);   // Result[CID] = GID, 0-initialised (.notdef)
+  if charsetOff > 2 then
+  begin
+    fmt := RdU8(CFF, charsetOff);
+    g := 1; i := charsetOff + 1;
+    if fmt = 0 then
+      while (g < numGlyphs) and (i+1 < Length(CFF)) do
+      begin
+        cid := RdU16(CFF, i); Inc(i,2);
+        if cid <= $FFFF then Result[cid] := g;
+        Inc(g);
+      end
+    else if (fmt = 1) or (fmt = 2) then
+      while (g < numGlyphs) and (i < Length(CFF)) do
+      begin
+        first := RdU16(CFF, i); Inc(i,2);
+        if fmt = 1 then begin nLeft := RdU8(CFF,i); Inc(i); end
+        else begin nLeft := RdU16(CFF,i); Inc(i,2); end;
+        for k := 0 to nLeft do
+        begin
+          if g >= numGlyphs then Break;
+          cid := first + k;
+          if cid <= $FFFF then Result[cid] := g;
+          Inc(g);
+        end;
+      end;
+  end
+  else
+    for g := 1 to numGlyphs - 1 do Result[g] := g;   // predefined/identity charset
+
+  maxCid := 0;
+  for i := 0 to High(Result) do if Result[i] <> 0 then maxCid := i;
+  SetLength(Result, maxCid + 1);
 end;
 
 // Assemble an SFNT from tables (sorted by tag), fixing offsets/checksums and
