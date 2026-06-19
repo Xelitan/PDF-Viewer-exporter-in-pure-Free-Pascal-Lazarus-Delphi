@@ -34,6 +34,12 @@ type
     // Active ExtGState soft mask (a TPdfSoftMask, owned by the page) or nil.
     // Elements painted while this is set are composited through the mask.
     SoftMask: TObject;
+    // Current fill/stroke colour space objects set by cs/CS (the resolved
+    // ColorSpace object: a Separation/DeviceN/ICCBased/Lab array, owned by the
+    // document object tree). nil = a plain device space; then sc/scn interpret
+    // operands by count (1=gray, 3=rgb, 4=cmyk). Cloned as plain references.
+    FillCSObj: TObject;
+    StrokeCSObj: TObject;
     // Active non-rectangular clip paths (TPdfClipPath refs, owned by the page).
     // The effective clip is the intersection of HasClip's rect and all of these.
     ClipPaths: array of TObject;
@@ -92,6 +98,8 @@ begin
   Result.ClipX2 := ClipX2;
   Result.ClipY2 := ClipY2;
   Result.SoftMask := SoftMask;
+  Result.FillCSObj := FillCSObj;
+  Result.StrokeCSObj := StrokeCSObj;
   Result.ClipPaths := Copy(ClipPaths);  // copy refs; TPdfClipPath objects owned by page
 end;
 

@@ -279,6 +279,7 @@ type
     FTrailer: TPdfDictionaryObject;
     FPages: TObjectList;
     FObjectCache: TFPHashObjectList;
+    FTintCache: TFPHashObjectList;  // cached Separation/DeviceN tint transforms (owns TPdfFunction), keyed by CS object pointer
     // Writer state
     FRemoved:       array of Boolean;
     FExtraImages:   array of array of TPdfExtraImage;
@@ -340,6 +341,8 @@ type
     procedure InterpretContent(Page: TPdfPage; const Bytes: TPdfBytes; Resources: TPdfDictionaryObject; const InitialCTM: TPdfMatrix; InitialSoftMask: TObject = nil; InitialMark: Integer = -1);
     function BuildIndexedRGBPalette(CSArr: TPdfArrayObject; out Pal: TPdfBytes): Integer;
     procedure ParseLabColorSpace(CSArr: TPdfArrayObject; var Range: array of Double; var White: array of Double);
+    function ColorFromCSObj(CSObj: TObject; const Nums: array of Double; out r, g, b: Double): Boolean;
+    function ResolveNamedCS(Res: TPdfDictionaryObject; const csName: string): TObject;
     function BuildFunction(Obj: TPdfObject): TPdfFunction;
     function BuildShading(ShadingObj: TPdfObject; const ACTM: TPdfMatrix): TPdfShadingElement;
     function BuildSoftMask(Page: TPdfPage; SMaskDict: TPdfDictionaryObject; const ACTM: TPdfMatrix): TPdfSoftMask;
@@ -962,6 +965,7 @@ begin
   inherited Create;
   FPages := TObjectList.Create(True);
   FObjectCache := TFPHashObjectList.Create(True);
+  FTintCache := TFPHashObjectList.Create(True);
   FRenderZoom := 1.0;
     FSecurity := nil;
     FEncryptReady := False;
@@ -974,6 +978,7 @@ begin
   FSecurity.Free;
   FTrailer.Free;
   FObjectCache.Free;
+  FTintCache.Free;
   FPages.Free;
   FImported.Free;
   inherited Destroy;
@@ -2662,6 +2667,123 @@ begin
   end;
 end;
 
+// Convert a colour given in a non-trivial colour space (set by cs/CS) plus its
+// sc/scn operands to RGB (0..1). Handles ICCBased (by N), CalRGB/CalGray, Lab,
+// and Separation/DeviceN (evaluates the tint transform into the alternate space,
+// then converts that). Returns False for plain device spaces / unknowns so the
+// caller falls back to interpreting operands by count.
+function TPdfDocument.ColorFromCSObj(CSObj: TObject; const Nums: array of Double;
+  out r, g, b: Double): Boolean;
+
+  // Convert components already expressed in colour space `cs` to RGB.
+  function CompsToRGB(cs: TPdfObject; const C: TDoubleArray; out rr, gg, bb: Double): Boolean;
+  var nm: string; arr: TPdfArrayObject; iccStm: TPdfObject;
+      n: Integer; rng: array[0..3] of Double; wht: array[0..2] of Double;
+      lab, labrgb: TPdfBytes; i: Integer;
+  begin
+    Result := False;
+    cs := ResolveObject(TPdfObject(cs));
+    if cs is TPdfNameObject then
+    begin
+      nm := cs.AsName;
+      if (SameText(nm,'DeviceGray') or SameText(nm,'CalGray') or SameText(nm,'G')) and (Length(C)>=1) then
+      begin rr:=C[0]; gg:=C[0]; bb:=C[0]; Result:=True; end
+      else if (SameText(nm,'DeviceRGB') or SameText(nm,'CalRGB') or SameText(nm,'RGB')) and (Length(C)>=3) then
+      begin rr:=C[0]; gg:=C[1]; bb:=C[2]; Result:=True; end
+      else if (SameText(nm,'DeviceCMYK') or SameText(nm,'CMYK')) and (Length(C)>=4) then
+      begin rr:=(1-C[0])*(1-C[3]); gg:=(1-C[1])*(1-C[3]); bb:=(1-C[2])*(1-C[3]); Result:=True; end;
+    end
+    else if cs is TPdfArrayObject then
+    begin
+      arr := TPdfArrayObject(cs);
+      if arr.Items.Count < 1 then Exit;
+      nm := ResolveObject(TPdfObject(arr.Items[0])).AsName;
+      if SameText(nm,'ICCBased') and (arr.Items.Count>=2) then
+      begin
+        iccStm := ResolveObject(TPdfObject(arr.Items[1]));
+        n := 3;
+        if iccStm is TPdfStreamObject then n := Trunc(TPdfStreamObject(iccStm).GetNumber('N', 3));
+        if (n=1) and (Length(C)>=1) then begin rr:=C[0]; gg:=C[0]; bb:=C[0]; Result:=True; end
+        else if (n=4) and (Length(C)>=4) then begin rr:=(1-C[0])*(1-C[3]); gg:=(1-C[1])*(1-C[3]); bb:=(1-C[2])*(1-C[3]); Result:=True; end
+        else if Length(C)>=3 then begin rr:=C[0]; gg:=C[1]; bb:=C[2]; Result:=True; end;
+      end
+      else if (SameText(nm,'CalRGB')) and (Length(C)>=3) then
+      begin rr:=C[0]; gg:=C[1]; bb:=C[2]; Result:=True; end
+      else if (SameText(nm,'CalGray')) and (Length(C)>=1) then
+      begin rr:=C[0]; gg:=C[0]; bb:=C[0]; Result:=True; end
+      else if SameText(nm,'Lab') and (Length(C)>=3) then
+      begin
+        ParseLabColorSpace(arr, rng, wht);
+        // Pack the L*a*b* values as one 8-bit pixel and reuse the image decoder.
+        SetLength(lab,3);
+        if rng[1]<>rng[0] then i:=Round((C[1]-rng[0])/(rng[1]-rng[0])*255) else i:=0;
+        lab[0]:=EnsureRange(Round(C[0]/100*255),0,255);
+        lab[1]:=EnsureRange(i,0,255);
+        if rng[3]<>rng[2] then i:=Round((C[2]-rng[2])/(rng[3]-rng[2])*255) else i:=0;
+        lab[2]:=EnsureRange(i,0,255);
+        if PdfDecodeLabToRGB(lab,1,1,8,rng,wht[0],wht[1],wht[2],labrgb) then
+        begin rr:=labrgb[0]/255; gg:=labrgb[1]/255; bb:=labrgb[2]/255; Result:=True; end;
+      end;
+    end;
+  end;
+
+var arr: TPdfArrayObject; nm, key: string; altCS, tintObj: TPdfObject;
+    fn: TPdfFunction; inp, outp: TDoubleArray; i: Integer;
+begin
+  Result := False;
+  r := 0; g := 0; b := 0;
+  if not (CSObj is TPdfArrayObject) then Exit;
+  arr := TPdfArrayObject(CSObj);
+  if arr.Items.Count < 1 then Exit;
+  nm := ResolveObject(TPdfObject(arr.Items[0])).AsName;
+  if (SameText(nm,'Separation') or SameText(nm,'DeviceN')) and (arr.Items.Count>=4) then
+  begin
+    altCS  := ResolveObject(TPdfObject(arr.Items[2]));
+    tintObj := TPdfObject(arr.Items[3]);
+    // Build/cache the tint transform (tints -> alternate-space components).
+    key := IntToHex(PtrUInt(CSObj), 16);
+    fn := TPdfFunction(FTintCache.Find(key));
+    if fn = nil then
+    begin
+      fn := BuildFunction(tintObj);
+      if Assigned(fn) then FTintCache.Add(key, fn);
+    end;
+    if not Assigned(fn) then Exit;
+    SetLength(inp, Length(Nums));
+    for i := 0 to High(Nums) do inp[i] := Nums[i];
+    fn.EvalN(inp, outp);
+    Result := CompsToRGB(altCS, outp, r, g, b);
+  end
+  else
+  begin
+    // ICCBased / CalRGB / CalGray / Lab: interpret the operands directly.
+    SetLength(inp, Length(Nums));
+    for i := 0 to High(Nums) do inp[i] := Nums[i];
+    Result := CompsToRGB(TPdfObject(CSObj), inp, r, g, b);
+  end;
+end;
+
+// Resolve a colour-space name from a `cs`/`CS` operator to the object sc/scn
+// should interpret operands against. Returns nil for device spaces (DeviceGray/
+// RGB/CMYK, Pattern, or a resource alias that resolves to one) so the caller uses
+// the operand-count rule; returns the array object for Separation/DeviceN/
+// ICCBased/CalRGB/CalGray/Lab.
+function TPdfDocument.ResolveNamedCS(Res: TPdfDictionaryObject; const csName: string): TObject;
+var csd, cso: TPdfObject;
+begin
+  Result := nil;
+  if csName = '' then Exit;
+  if SameText(csName,'DeviceGray') or SameText(csName,'DeviceRGB') or
+     SameText(csName,'DeviceCMYK') or SameText(csName,'Pattern') or
+     SameText(csName,'G') or SameText(csName,'RGB') or SameText(csName,'CMYK') then
+    Exit;
+  if not Assigned(Res) then Exit;
+  csd := ResolveObject(Res.Get('ColorSpace'));
+  if not (csd is TPdfDictionaryObject) then Exit;
+  cso := ResolveObject(TPdfDictionaryObject(csd).Get(csName));
+  if cso is TPdfArrayObject then Result := cso;  // name alias -> nil (device)
+end;
+
 // Build a shading paint element from a shading dictionary, capturing the CTM.
 function TPdfDocument.BuildShading(ShadingObj: TPdfObject; const ACTM: TPdfMatrix): TPdfShadingElement;
 var D: TPdfDictionaryObject;
@@ -3665,6 +3787,7 @@ var S: AnsiString;
   var Nums: array of Double;
     I, C: Integer;
     r,g,b: Double;
+    cso: TObject;
   begin
     SetLength(Nums, 0);
     for I := 0 to Stack.Count - 1 do
@@ -3675,7 +3798,15 @@ var S: AnsiString;
         Nums[C] := TOperand(Stack[I]).Obj.AsNumber;
       end;
     C := Length(Nums);
-    if C = 1 then begin
+    // A non-device space set by cs/CS (Separation, DeviceN, ICCBased, Lab, …):
+    // interpret the operands through it (e.g. a Separation tint transform). For
+    // plain device spaces (cso=nil) fall back to the operand-count rule below.
+    if AFill then cso := GS.Current.FillCSObj else cso := GS.Current.StrokeCSObj;
+    if Assigned(cso) and (C >= 1) and ColorFromCSObj(cso, Nums, r, g, b) then
+    begin
+      // r,g,b filled
+    end
+    else if C = 1 then begin
       r := Nums[0];
       g := Nums[0];
       b := Nums[0];
@@ -3833,6 +3964,11 @@ begin
           O2:=PopObj;
           O1:=PopObj;
           if Assigned(O1) then begin
+            // TD additionally sets the text leading to -ty (the next-line offset),
+            // which subsequent T* / ' / " operators use. Without this, a PDF that
+            // sets leading via TD and then advances with T* piles every line onto
+            // the same baseline.
+            if (T='TD') and Assigned(O2) then GS.Current.Leading := -O2.AsNumber;
             GS.Current.TextLineMatrix := PdfMatrixMultiply(PdfMatrixTranslate(O1.AsNumber,O2.AsNumber), GS.Current.TextLineMatrix);
             GS.Current.TextMatrix := GS.Current.TextLineMatrix;
           end;
@@ -4084,11 +4220,21 @@ begin
         end
         else if (T='ri') or (T='i') or
                 (T='J') or (T='j') or (T='M') or
-                (T='cs') or (T='CS') or
                 (T='Tz') then begin
                   O1:=PopObj;
                   O1.Free;
                 end
+        // Colour space selection: remember non-device spaces so sc/scn can
+        // interpret their operands (Separation tint transforms, ICCBased N, …).
+        else if (T='cs') or (T='CS') then begin
+          O1:=PopObj;
+          if Assigned(O1) then
+          begin
+            if T='cs' then GS.Current.FillCSObj := ResolveNamedCS(Resources, O1.AsName)
+            else GS.Current.StrokeCSObj := ResolveNamedCS(Resources, O1.AsName);
+          end;
+          O1.Free;
+        end
         // Stroking RGB: RG
         else if T='RG' then begin
           O3:=PopObj;
