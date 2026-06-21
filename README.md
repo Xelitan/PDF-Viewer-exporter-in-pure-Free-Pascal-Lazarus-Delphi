@@ -106,6 +106,10 @@ Doc.AddText(PageIndex, 'Test Here', Left, Top, FontRes);
 ```    
 Doc.ExtractTextToFile(PageIndex, 'output.txt');
 ```
+## Features
+
+Printing, rotating, extracting text, removing pages.
+
 ## Supports encrypted PDFs
 
 Supports:
