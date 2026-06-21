@@ -16,7 +16,7 @@ interface
 uses
   Classes, SysUtils, Math, Contnrs,
   LCLType, LCLIntf,
-  Controls, StdCtrls, Graphics, Clipbrd, Forms, Dialogs,
+  Controls, StdCtrls, Graphics, Clipbrd, Forms, Dialogs, Printers,
   PdfParser, PdfBitmapRenderer, PdfMarkdown, PdfTypes;
 
 const
@@ -146,6 +146,14 @@ type
     // RotateLeft, AddText, DrawRect, RemovePage). Plain Refresh/Repaint don't
     // help because rendered pages are cached and only rebuilt when nil.
     procedure RefreshView;
+
+    // Print a range of pages on the default printer. Each page is rendered to a
+    // memory bitmap at the printer's resolution (capped to bound memory) and then
+    // blitted onto the paper, scaled to fit the printable area, aspect kept.
+    // FromPage/ToPage are 0-based, inclusive; the defaults (0 .. MaxInt) print
+    // every page. The range is clamped to the document's page count.
+    procedure Print(const JobTitle: string = 'PDF Document';
+                    FromPage: Integer = 0; ToPage: Integer = MaxInt);
 
     property SearchResultCount : Integer read GetSearchResultCount;
     property Scale             : Double  read FScale write SetScale;
@@ -513,6 +521,78 @@ begin
     ScrollToPage(OldPage);
   end;
   Invalidate;
+end;
+
+// ---------------------------------------------------------------------------
+// Printing
+// ---------------------------------------------------------------------------
+//
+// We do NOT drive GDI/GDI+ primitives straight onto the printer DC. The page
+// renderer composites transparency and ExtGState soft masks by reading pixels
+// back (ScanLine / AlphaBlend), which printer DCs don't support. Instead each
+// page is rendered into a memory bitmap at the printer's resolution -- there the
+// renderer's full GDI+ pipeline (vector antialiasing, image scaling) runs
+// normally -- and the finished bitmap is blitted onto the paper. Rendering at
+// print DPI means the final blit is ~1:1, so no quality is lost scaling on the
+// printer side.
+procedure TXelPDF.Print(const JobTitle: string; FromPage: Integer; ToPage: Integer);
+var
+  I: Integer;
+  Page: TPdfPage;
+  Bmp: TBitmap;
+  SavedOpts, Opts: TPdfBitmapRenderOptions;
+  pageWpt, pageHpt, dotsW, dotsH, fit, renderScale, maxScale: Double;
+  destW, destH, offX, offY: Integer;
+begin
+  if (not Assigned(FDocument)) or (FDocument.Pages.Count = 0) then Exit;
+  // Clamp the requested range to valid page indices.
+  if FromPage < 0 then FromPage := 0;
+  if ToPage > FDocument.Pages.Count - 1 then ToPage := FDocument.Pages.Count - 1;
+  if FromPage > ToPage then Exit;  // empty range
+  SavedOpts := FRenderer.Options;
+  Printer.Title := JobTitle;
+  Printer.BeginDoc;
+  try
+    // Cap render resolution to ~300 DPI: an A4 page at 600 DPI would be a
+    // ~100 MB bitmap. 300 DPI is plenty for text and line art.
+    maxScale := 300.0 / 72.0;
+    for I := FromPage to ToPage do
+    begin
+      if I > FromPage then Printer.NewPage;
+      Page := TPdfPage(FDocument.Pages[I]);
+      pageWpt := Page.EffectiveWidth;
+      pageHpt := Page.EffectiveHeight;
+      if (pageWpt <= 0) or (pageHpt <= 0) then Continue;
+      // Page size in printer dots at 100% (1 pt = 1/72").
+      dotsW := pageWpt / 72.0 * Printer.XDPI;
+      dotsH := pageHpt / 72.0 * Printer.YDPI;
+      // Fit to the printable area, keep aspect ratio, never upscale past 100%.
+      fit := Min(Printer.PageWidth / dotsW, Printer.PageHeight / dotsH);
+      if fit > 1.0 then fit := 1.0;
+      destW := Max(1, Round(dotsW * fit));
+      destH := Max(1, Round(dotsH * fit));
+      // Render the bitmap at the on-paper device size, capped at maxScale.
+      renderScale := destW / pageWpt;       // pixels per PDF point
+      if renderScale > maxScale then renderScale := maxScale;
+      Opts := SavedOpts;
+      Opts.Scale := renderScale;
+      FRenderer.Options := Opts;
+      Bmp := FRenderer.RenderPageToBitmap(Page);
+      try
+        offX := (Printer.PageWidth  - destW) div 2;   // centre on the sheet
+        offY := (Printer.PageHeight - destH) div 2;
+        Printer.Canvas.StretchDraw(Rect(offX, offY, offX + destW, offY + destH), Bmp);
+      finally
+        Bmp.Free;
+      end;
+    end;
+    Printer.EndDoc;
+  except
+    Printer.Abort;
+    FRenderer.Options := SavedOpts;
+    raise;
+  end;
+  FRenderer.Options := SavedOpts;
 end;
 
 // Recompute the render scale so the first page's width (afWidth) or height

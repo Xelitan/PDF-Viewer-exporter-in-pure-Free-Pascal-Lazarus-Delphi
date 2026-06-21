@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, ExtCtrls,
-  Menus, Interfaces, PdfParser, PdfBitmapRenderer, XelPDF;
+  Menus, PrintersDlgs, Interfaces, PdfParser, PdfBitmapRenderer, XelPDF;
 
 type
 
@@ -25,6 +25,7 @@ type
     MenuItem18: TMenuItem;
     MenuItem19: TMenuItem;
     MenuItem7: TMenuItem;
+    MenuItemPrint: TMenuItem;
     SelectDirectoryDialog1: TSelectDirectoryDialog;
     Separator3: TMenuItem;
     Separator2: TMenuItem;
@@ -56,6 +57,7 @@ type
     procedure MenuItem5Click(Sender: TObject);
     procedure MenuItem7Click(Sender: TObject);
     procedure MenuItem8Click(Sender: TObject);
+    procedure MenuItemPrintClick(Sender: TObject);
   private
 
   public
@@ -173,6 +175,46 @@ procedure TForm1.MenuItem7Click(Sender: TObject);
 begin
   Pdf.Document.RotateLeft(Pdf.CurrentPage);
   Pdf.RefreshView;  // rotation changes the document behind the viewer; rebuild cache
+end;
+
+procedure TForm1.MenuItemPrintClick(Sender: TObject);
+var Dlg: TPrintDialog;
+    PageCount, FromPg, ToPg: Integer;
+begin
+  if (Pdf.Document = nil) or (Pdf.Document.Pages.Count = 0) then Exit;
+  PageCount := Pdf.Document.Pages.Count;
+  Dlg := TPrintDialog.Create(nil);
+  try
+    // Enable the "Pages from..to" box and seed it with the full range.
+    Dlg.Options  := Dlg.Options + [poPageNums];
+    Dlg.MinPage  := 1;
+    Dlg.MaxPage  := PageCount;
+    Dlg.FromPage := 1;
+    Dlg.ToPage   := PageCount;
+    Dlg.PrintRange := prAllPages;
+    if not Dlg.Execute then Exit;  // user cancelled / no printer chosen
+
+    // Dialog page numbers are 1-based; TXelPDF.Print expects 0-based, inclusive.
+    if Dlg.PrintRange = prPageNums then
+    begin
+      FromPg := Dlg.FromPage - 1;
+      ToPg   := Dlg.ToPage - 1;
+    end
+    else
+    begin
+      FromPg := 0;
+      ToPg   := PageCount - 1;  // all pages
+    end;
+
+    try
+      Pdf.Print('PDF Document', FromPg, ToPg);
+    except
+      on E: Exception do
+        MessageDlg('Printing failed', E.Message, mtError, [mbOK], 0);
+    end;
+  finally
+    Dlg.Free;
+  end;
 end;
 
 procedure TForm1.MenuItem8Click(Sender: TObject);
