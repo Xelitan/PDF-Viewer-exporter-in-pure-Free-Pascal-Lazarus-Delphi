@@ -130,7 +130,8 @@ type
     // Search for AText across all pages.
     // Returns number of matches found.
     // Scrolls to the first match automatically.
-    function  Search(const AText: string): Integer;
+    // CaseSensitive=False (default) matches regardless of letter case.
+    function  Search(const AText: string; CaseSensitive: Boolean = False): Integer;
     procedure SearchNext;
     procedure SearchPrev;
     procedure ClearSearch;
@@ -1011,38 +1012,156 @@ end;
 // Search
 // ---------------------------------------------------------------------------
 
-function TXelPDF.Search(const AText: string): Integer;
+// Fold one character for case-insensitive comparison while keeping the string
+// length 1:1 (so match positions still map back to elements). Characters whose
+// upper-case form isn't a single char (e.g. German ß -> SS) are left as-is.
+function FoldChar(ch: WideChar; CaseSensitive: Boolean): WideChar;
+var u: UnicodeString;
+begin
+  if CaseSensitive then Exit(ch);
+  u := WideUpperCase(UnicodeString(ch));
+  if Length(u) = 1 then Result := u[1] else Result := ch;
+end;
+
+function TXelPDF.Search(const AText: string; CaseSensitive: Boolean): Integer;
 var
-  PI, EI       : Integer;
+  PI, EI, CI, K, NeedleLen : Integer;
   Page         : TPdfPage;
   Elem         : TPdfPageElement;
-  TextElem     : TPdfTextElement;
-  NeedleU, HaystackU : UnicodeString;
+  TE, PrevTE   : TPdfTextElement;
+  NeedleU, LineU : UnicodeString;
+  // For each character in LineU: which element / char it came from (ElemIdx = -1
+  // marks an inserted word-gap space that belongs to no element).
+  MapElem, MapChar : array of Integer;
+  LineActive   : Boolean;
+  LineY, LineH, GapThresh, PrevRight, LeftX, ElemRight : Double;
+
+  // Search the just-built line, recording one result per (non-overlapping) match.
+  // A match may span several elements; the highlight is the union of those
+  // elements' rectangles.
+  procedure FlushLine;
+  var s, j, ei2 : Integer;
+      R, ER : TPdfRect;
+      started : Boolean;
+  begin
+    if (NeedleLen = 0) or (Length(LineU) < NeedleLen) then Exit;
+    s := 1;
+    while s <= Length(LineU) - NeedleLen + 1 do
+    begin
+      if Copy(LineU, s, NeedleLen) = NeedleU then
+      begin
+        // Union the rects of every element covered by [s .. s+NeedleLen-1].
+        started := False;
+        R.X1 := 0; R.Y1 := 0; R.X2 := 0; R.Y2 := 0;
+        for j := s - 1 to s - 1 + NeedleLen - 1 do
+        begin
+          ei2 := MapElem[j];
+          if ei2 < 0 then Continue;  // inserted gap space
+          ER := TextElemApproxPdfRect(TPdfTextElement(Page.Elements[ei2]));
+          if not started then
+          begin
+            R := ER; started := True;
+          end
+          else
+          begin
+            if ER.X1 < R.X1 then R.X1 := ER.X1;
+            if ER.Y1 < R.Y1 then R.Y1 := ER.Y1;
+            if ER.X2 > R.X2 then R.X2 := ER.X2;
+            if ER.Y2 > R.Y2 then R.Y2 := ER.Y2;
+          end;
+        end;
+        if started then
+        begin
+          SetLength(FSearchResults, FSearchResultCount + 1);
+          FSearchResults[FSearchResultCount].PageIndex    := PI;
+          FSearchResults[FSearchResultCount].ElementIndex := MapElem[s - 1];
+          FSearchResults[FSearchResultCount].Bounds       := R;
+          Inc(FSearchResultCount);
+        end;
+        s := s + NeedleLen;  // non-overlapping
+      end
+      else
+        Inc(s);
+    end;
+  end;
+
+  procedure ResetLine;
+  begin
+    LineU := '';
+    SetLength(MapElem, 0);
+    SetLength(MapChar, 0);
+    LineActive := False;
+    PrevRight := 0;
+  end;
+
+  procedure AppendChar(ch: WideChar; aElem, aChar: Integer);
+  var n: Integer;
+  begin
+    LineU := LineU + FoldChar(ch, CaseSensitive);
+    n := Length(MapElem);
+    SetLength(MapElem, n + 1); SetLength(MapChar, n + 1);
+    MapElem[n] := aElem; MapChar[n] := aChar;
+  end;
+
 begin
   ClearSearch;
   if AText = '' then Exit(0);
   FSearchText := AText;
-  NeedleU     := WideUpperCase(UTF8Decode(AText));
+  NeedleU := UTF8Decode(AText);
+  if not CaseSensitive then
+    for K := 1 to Length(NeedleU) do NeedleU[K] := FoldChar(NeedleU[K], False);
+  NeedleLen := Length(NeedleU);
 
   for PI := 0 to FDocument.Pages.Count - 1 do
   begin
     Page := TPdfPage(FDocument.Pages[PI]);
     Page.EnsureParsed;
+    ResetLine;
+    PrevTE := nil;
+    // Concatenate text elements line by line (elements in content order are
+    // reading order for typical producers). Words split across elements
+    // ("Docu"+"ment") rejoin; a wide horizontal gap becomes a single space.
     for EI := 0 to Page.Elements.Count - 1 do
     begin
       Elem := TPdfPageElement(Page.Elements[EI]);
       if Elem.Kind <> pekText then Continue;
-      TextElem   := TPdfTextElement(Elem);
-      HaystackU  := WideUpperCase(TextElem.Text);
-      if Pos(NeedleU, HaystackU) > 0 then
+      TE := TPdfTextElement(Elem);
+      if Length(TE.Text) = 0 then Continue;
+
+      LineH := TE.FontSize * Abs(TE.Matrix.D);
+      if LineH < 1 then LineH := 1;
+      // New line when the baseline jumps by more than half a line height.
+      if LineActive and (Abs(TE.Matrix.F - LineY) > 0.5 * LineH) then
       begin
-        SetLength(FSearchResults, FSearchResultCount + 1);
-        FSearchResults[FSearchResultCount].PageIndex    := PI;
-        FSearchResults[FSearchResultCount].ElementIndex := EI;
-        FSearchResults[FSearchResultCount].Bounds       := TextElemApproxPdfRect(TextElem);
-        Inc(FSearchResultCount);
+        FlushLine;
+        ResetLine;
       end;
+      if not LineActive then
+      begin
+        LineActive := True;
+        LineY := TE.Matrix.F;
+      end;
+
+      // Insert a space when there's a real word gap between this element and the
+      // previous one on the line (but not for directly-abutting split glyphs).
+      LeftX := TE.Matrix.E;
+      if (Length(LineU) > 0) and Assigned(PrevTE) then
+      begin
+        GapThresh := 0.25 * PrevTE.FontSize * Abs(PrevTE.Matrix.A);
+        if GapThresh < 1 then GapThresh := 1;
+        if (LeftX - PrevRight > GapThresh) and (LineU[Length(LineU)] <> ' ') then
+          AppendChar(' ', -1, -1);
+      end;
+
+      for CI := 0 to Length(TE.Text) - 1 do
+        AppendChar(TE.Text[CI + 1], EI, CI);
+
+      if TE.Bounds.X2 > TE.Bounds.X1 then ElemRight := TE.Bounds.X2
+      else ElemRight := TE.Matrix.E + TE.FontSize * Abs(TE.Matrix.A) * Length(TE.Text) * 0.55;
+      PrevRight := ElemRight;
+      PrevTE := TE;
     end;
+    FlushLine;  // last line on the page
   end;
 
   Result := FSearchResultCount;
