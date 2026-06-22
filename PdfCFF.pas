@@ -433,6 +433,10 @@ function TableChecksum(const B: TBytes): LongWord;
 var i: Integer;
   w: LongWord;
 begin
+  // The OpenType table checksum is a sum of big-endian uint32s taken mod 2^32,
+  // so the accumulation is meant to wrap
+
+  {$push}{$Q-}{$R-}
   Result := 0;
   i := 0;
   while i + 3 < Length(B) do
@@ -441,6 +445,7 @@ begin
     Result := Result + w;
     i := i + 4;
   end;
+  {$pop}
 end;
 
 function StreamBytes(S: TMemoryStream): TBytes;
@@ -993,7 +998,13 @@ begin
     end;
 
     fontB := Pad4(StreamBytes(out_));
+
+    // head.checkSumAdjustment = 0xB1B0AFBA - (sum of the whole font) mod 2^32.
+    // The subtraction is meant to wrap
+    {$push}{$Q-}{$R-}
     adj := $B1B0AFBA - TableChecksum(fontB);
+    {$pop}
+
     savedPos := out_.Position;
     out_.Position := headOffInFont + 8;
     W32(out_, adj);

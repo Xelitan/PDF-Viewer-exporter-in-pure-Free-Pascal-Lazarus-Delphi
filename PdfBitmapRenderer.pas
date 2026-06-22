@@ -431,7 +431,11 @@ begin
   // actual bytes, not just the name — otherwise every run reuses the first subset's
   // glyphs/charset and renders the wrong text.
   Sig := LongWord(Length(Data));
+
+  // Rolling hash: the 32-bit wrap-around is intentional
+  {$push}{$Q-}{$R-}
   for I := 0 to High(Data) do Sig := Sig * 31 + Data[I];
+  {$pop}
 
   // Return cached entry if already loaded.
   for I := 0 to High(FLoadedFonts) do
