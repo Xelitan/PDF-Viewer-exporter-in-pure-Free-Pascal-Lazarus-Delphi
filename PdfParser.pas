@@ -4892,8 +4892,11 @@ procedure TPdfDocument.AddJpegImage(PageIndex: Integer; const JpegData: TPdfByte
                                     X, Y, W, H: Double);
 var Idx: Integer;
   Img: TPdfExtraImage;
+  pg: TPdfPage;
+  ie: TPdfImageElement;
 begin
   if (PageIndex < 0) or (PageIndex >= FPages.Count) then Exit;
+  // Persisted edit (written into the page content + resources on Save).
   Idx := Length(FExtraImages[PageIndex]);
   SetLength(FExtraImages[PageIndex], Idx + 1);
   Img.JpegData := JpegData;
@@ -4903,6 +4906,16 @@ begin
   Img.H := H;
   Img.ResName  := AnsiString(Format('WImg%d', [Idx]));
   FExtraImages[PageIndex][Idx] := Img;
+  // Live element so it renders immediately (not only after Save+reload), like
+  // DrawRect/AddText. The JPEG decoder reads dimensions from the data itself; the
+  // matrix maps the unit square onto [X..X+W] x [Y..Y+H] in page space.
+  pg := TPdfPage(FPages[PageIndex]);
+  pg.EnsureParsed;
+  ie := TPdfImageElement.Create;
+  ie.Data       := JpegData;
+  ie.ColorSpace := 'DeviceRGB';
+  ie.Matrix     := PdfMatrixFrom(W, 0, 0, H, X, Y);
+  pg.Elements.Add(ie);
 end;
 
 function TPdfDocument.AddFont(const FontName: string; FontSize: Double): AnsiString;

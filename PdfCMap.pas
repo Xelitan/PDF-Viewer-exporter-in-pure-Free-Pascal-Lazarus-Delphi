@@ -133,8 +133,8 @@ procedure TPdfCMap.LoadFromText(const Text: AnsiString);
 var
   SL: TStringList;
   I, K: Integer;
-  L, A, B, C: AnsiString;
-  P1, P2, P3, P4, P5, P6: Integer;
+  L, A, B, C, Rest: AnsiString;
+  P1, P2, P3, P4, P5, P6, Q, QA, QB: Integer;
   InBfChar, InBfRange: Boolean;
   LowCode, HighCode, StartUni, ByteCount: Integer;
 begin
@@ -182,22 +182,47 @@ begin
         // <srcCode> <unicodeHex>
         AddMapping(HexToBytes(A), HexToUnicode(B));
       end else begin
-        // bfrange: <lowCode> <highCode> <startUnicode> — expand into individual mappings
-        P5 := PosEx('<', string(L), P4 + 1);
-        if P5 = 0 then Continue;
-        P6 := PosEx('>', string(L), P5 + 1);
-        if P6 = 0 then Continue;
-        C := Copy(L, P5 + 1, P6 - P5 - 1);
-
+        // bfrange has two destination forms:
+        //   <lo> <hi> <startUni>        : lo->startUni, lo+1->startUni+1, ...
+        //   <lo> <hi> [<u0> <u1> ...]   : lo->u0, lo+1->u1, ... (each its own value)
+        // Misreading the array form as the incrementing one corrupts characters
+        // (e.g. a period mapped to ';'), so handle the array explicitly.
         LowCode  := HexToInt(A);
         HighCode := HexToInt(B);
-        StartUni := HexToInt(C);
         ByteCount := Length(A) div 2;
         if ByteCount < 1 then ByteCount := 1;
 
-        for K := LowCode to HighCode do
-          AddMapping(IntToCodeBytes(K, ByteCount),
-                     WideChar(StartUni + (K - LowCode)));
+        Rest := AnsiString(Trim(Copy(string(L), P4 + 1, Length(L))));
+        if (Length(Rest) > 0) and (Rest[1] = '[') then
+        begin
+          // Array form: pair each consecutive <hex> with the next code.
+          K := LowCode;
+          Q := 1;
+          while K <= HighCode do
+          begin
+            QA := PosEx('<', string(Rest), Q);
+            if QA = 0 then Break;
+            QB := PosEx('>', string(Rest), QA + 1);
+            if QB = 0 then Break;
+            C := Copy(Rest, QA + 1, QB - QA - 1);
+            AddMapping(IntToCodeBytes(K, ByteCount), HexToUnicode(C));
+            Inc(K);
+            Q := QB + 1;
+          end;
+        end
+        else
+        begin
+          // Incrementing form.
+          P5 := PosEx('<', string(L), P4 + 1);
+          if P5 = 0 then Continue;
+          P6 := PosEx('>', string(L), P5 + 1);
+          if P6 = 0 then Continue;
+          C := Copy(L, P5 + 1, P6 - P5 - 1);
+          StartUni := HexToInt(C);
+          for K := LowCode to HighCode do
+            AddMapping(IntToCodeBytes(K, ByteCount),
+                       WideChar(StartUni + (K - LowCode)));
+        end;
       end;
     end;
   finally

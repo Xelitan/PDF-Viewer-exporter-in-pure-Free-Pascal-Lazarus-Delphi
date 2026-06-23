@@ -52,6 +52,7 @@ object Form1: TForm1
       end
       object MenuItem9: TMenuItem
         Caption = 'Export vectors'
+        OnClick = MenuItem9Click
       end
       object Separator2: TMenuItem
         Caption = '-'

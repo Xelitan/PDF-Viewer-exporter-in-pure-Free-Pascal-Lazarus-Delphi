@@ -5,10 +5,18 @@ unit Unit1;
 interface
 
 uses
-  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, ExtCtrls,
-  Menus, PrintersDlgs, Interfaces, PdfParser, PdfBitmapRenderer, XelPDF;
+  Classes, SysUtils, Types, Forms, Controls, Graphics, Dialogs, StdCtrls, ExtCtrls,
+  Menus, PrintersDlgs, Interfaces, PdfTypes, PdfParser, PdfBitmapRenderer, XelPDF;
 
 type
+
+  // Ctrl + mouse-wheel zoom, handled in the application (a TXelPDF descendant
+  // declared here) so the reusable TXelPDF control itself is left untouched.
+  TZoomPDF = class(TXelPDF)
+  protected
+    function DoMouseWheel(Shift: TShiftState; WheelDelta: Integer;
+                          MousePos: TPoint): Boolean; override;
+  end;
 
   { TForm1 }
 
@@ -57,9 +65,18 @@ type
     procedure MenuItem5Click(Sender: TObject);
     procedure MenuItem7Click(Sender: TObject);
     procedure MenuItem8Click(Sender: TObject);
+    procedure MenuItem9Click(Sender: TObject);
     procedure MenuItemPrintClick(Sender: TObject);
   private
-
+    FSearchPanel: TPanel;
+    FSearchEdit : TEdit;
+    FCaseChk    : TCheckBox;
+    FFindBtn    : TButton;
+    FLastQuery  : string;
+    FLastCase   : Boolean;
+    procedure BuildSearchBar;
+    procedure DoFind(Sender: TObject);
+    procedure SearchEditKeyPress(Sender: TObject; var Key: Char);
   public
     PDF: TXelPDF;
   end;
@@ -71,10 +88,83 @@ implementation
 
 {$R *.lfm}
 
+{ TZoomPDF }
+
+function TZoomPDF.DoMouseWheel(Shift: TShiftState; WheelDelta: Integer;
+  MousePos: TPoint): Boolean;
+begin
+  if ssCtrl in Shift then
+  begin
+    // Ctrl + wheel = zoom. Turn off width-fit so the manual zoom persists.
+    AutoFit := afNone;
+    if WheelDelta > 0 then Scale := Scale * 1.1
+    else                   Scale := Scale / 1.1;
+    Result := True;
+  end
+  else
+    Result := inherited DoMouseWheel(Shift, WheelDelta, MousePos);  // normal scroll
+end;
+
 { TForm1 }
 
 procedure TForm1.Button1Click(Sender: TObject);
 begin
+end;
+
+// Build the top search bar (query edit + "Case sensitive" checkbox + Find button)
+// entirely in code so no .lfm changes are needed.
+procedure TForm1.BuildSearchBar;
+begin
+  FSearchPanel := TPanel.Create(Self);
+  FSearchPanel.Parent     := Self;
+  FSearchPanel.Align      := alTop;
+  FSearchPanel.Height     := 32;
+  FSearchPanel.BevelOuter := bvNone;
+
+  FSearchEdit := TEdit.Create(Self);
+  FSearchEdit.Parent     := FSearchPanel;
+  FSearchEdit.SetBounds(4, 4, 220, 24);
+  FSearchEdit.TextHint   := 'Search text...';
+  FSearchEdit.OnKeyPress := @SearchEditKeyPress;
+
+  FCaseChk := TCheckBox.Create(Self);
+  FCaseChk.Parent  := FSearchPanel;
+  FCaseChk.SetBounds(232, 7, 120, 20);
+  FCaseChk.Caption := 'Case sensitive';
+
+  FFindBtn := TButton.Create(Self);
+  FFindBtn.Parent  := FSearchPanel;
+  FFindBtn.SetBounds(356, 4, 80, 24);
+  FFindBtn.Caption := 'Find';
+  FFindBtn.OnClick := @DoFind;
+end;
+
+procedure TForm1.DoFind(Sender: TObject);
+var n: Integer;
+begin
+  if FSearchEdit.Text = '' then Exit;
+  // New query (or toggled case) -> search; same query -> jump to the next match.
+  if (FSearchEdit.Text <> FLastQuery) or (FCaseChk.Checked <> FLastCase) then
+  begin
+    FLastQuery := FSearchEdit.Text;
+    FLastCase  := FCaseChk.Checked;
+    n := Pdf.Search(FLastQuery, FLastCase);
+    if n = 0 then
+      ShowMessage('Not found: ' + FLastQuery)
+    else
+      Caption := Format('Xelitan PDF  -  %d match(es) for "%s"', [n, FLastQuery]);
+  end
+  else
+    Pdf.SearchNext;
+end;
+
+procedure TForm1.SearchEditKeyPress(Sender: TObject; var Key: Char);
+begin
+  if Key = #13 then
+  begin
+    Key := #0;        // swallow Enter (avoids the warning beep)
+    DoFind(Sender);
+  end;
 end;
 
 procedure TForm1.FormClose(Sender: TObject; var CloseAction: TCloseAction);
@@ -84,14 +174,15 @@ end;
 
 procedure TForm1.FormCreate(Sender: TObject);
 begin
-  PDF := TXelPDF.Create(Form1);
+  BuildSearchBar;   // top bar (created first so the viewer fills the area below)
 
-  Pdf.Parent := Form1;
-  Pdf.Align := alClient;
-  PDf.AutoFit := afWidth;
+  PDF := TZoomPDF.Create(Self);   // TZoomPDF adds Ctrl+wheel zoom
+  Pdf.Parent  := Self;
+  Pdf.Align   := alClient;
+  Pdf.AutoFit := afWidth;
 
-  Pdf.LoadFromFile('2112.pdf');
-
+  Pdf.LoadFromFile('test2.pdf');
+  Pdf.RefreshView;  // reflect the freshly loaded document
 end;
 
 procedure TForm1.MenuItem10Click(Sender: TObject);
@@ -106,9 +197,28 @@ begin
 end;
 
 procedure TForm1.MenuItem13Click(Sender: TObject);
-var Jpeg: TBytes;
+var Dlg: TOpenDialog;
+    MS : TMemoryStream;
+    Data: TPdfBytes;
 begin
-  //Pdf.Document.AddJpegImage(Pdf.CurrentPage, Jpeg, 20, 20, 200, 200);
+  Dlg := TOpenDialog.Create(nil);
+  try
+    Dlg.Filter := 'JPEG images|*.jpg;*.jpeg';
+    if not Dlg.Execute then Exit;
+    MS := TMemoryStream.Create;
+    try
+      MS.LoadFromFile(Dlg.FileName);
+      SetLength(Data, MS.Size);
+      if MS.Size > 0 then Move(MS.Memory^, Data[0], MS.Size);
+    finally
+      MS.Free;
+    end;
+    // Place the image at (20,20), 200x200 page units (PDF origin = bottom-left).
+    Pdf.Document.AddJpegImage(Pdf.CurrentPage, Data, 20, 20, 200, 200);
+    Pdf.RefreshView;
+  finally
+    Dlg.Free;
+  end;
 end;
 
 procedure TForm1.MenuItem14Click(Sender: TObject);
@@ -151,7 +261,10 @@ end;
 procedure TForm1.MenuItem2Click(Sender: TObject);
 begin
   if not OpenDialog1.Execute then Exit;
-  Pdf.Document.LoadFromFile(OpenDialog1.Filename);
+  Pdf.LoadFromFile(OpenDialog1.Filename);  // viewer load (re-lays out pages)
+  Pdf.RefreshView;
+  FLastQuery := '';                         // reset search state for the new doc
+  Caption := 'Xelitan PDF';
 end;
 
 procedure TForm1.MenuItem3Click(Sender: TObject);
@@ -233,6 +346,23 @@ begin
   for i:=0 to Pdf.Document.ImagesCount(Pdf.CurrentPage)-1 do
     Pdf.Document.ExportImage(Pdf.CurrentPage, i, Dir + IntToStr(i+TotalJpegs) + '.png');
 
+end;
+
+procedure TForm1.MenuItem9Click(Sender: TObject);
+var i, cnt: Integer;
+    Dir: String;
+begin
+  cnt := Pdf.Document.VectorsCount(Pdf.CurrentPage);
+  if cnt = 0 then
+  begin
+    ShowMessage('No vector graphics on this page.');
+    Exit;
+  end;
+  if not SelectDirectoryDialog1.Execute then Exit;
+  Dir := IncludeTrailingPathDelimiter(SelectDirectoryDialog1.FileName);
+  for i := 0 to cnt - 1 do
+    Pdf.Document.ExportVector(Pdf.CurrentPage, i, Dir + Format('vector_%d.svg', [i + 1]));
+  ShowMessage(Format('Exported %d vector(s) to %s', [cnt, Dir]));
 end;
 
 end.
