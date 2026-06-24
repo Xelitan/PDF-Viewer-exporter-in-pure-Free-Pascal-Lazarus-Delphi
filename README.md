@@ -133,7 +133,8 @@ Images:
 - ICCBased images (RGB, CMYK, Gray).
 - Soft-mask transparency
 - Lab color-space images
-  
+- JPEG 2000 / JPXDecode
+    
 Embedded font formats:
 - TrueType — FontFile2
 - CFF / Type1C / CIDFontType0C / OpenType — FontFile3
@@ -142,5 +143,4 @@ Embedded font formats:
 
 Images:
 - JBIG2 images (monochrome)
-- JPEG 2000 / JPXDecode
 
