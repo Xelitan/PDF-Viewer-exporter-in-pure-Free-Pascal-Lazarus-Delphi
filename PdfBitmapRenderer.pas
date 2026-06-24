@@ -13,7 +13,8 @@ uses
   //Min, Max, the Rect type) are overridden by the LCL/Math units that follow,
   //while its raw GDI calls (PolyPolygon, clip regions) — which the LCL canvas
   //does not expose — stay reachable.
-  SysUtils, Classes, Windows, Graphics, StrUtils, Math, PdfTypes, PdfParser, PdfJpeg, PdfCFF;
+  SysUtils, Classes, Windows, Graphics, StrUtils, Math, PdfTypes, PdfParser, PdfJpeg, PdfCFF,
+  Jp2ImageX;  // JPEG 2000 (JPXDecode) decoder
 
 type
   TPdfBitmapRenderOptions = record
@@ -57,6 +58,7 @@ type
     procedure DrawIndexedImage(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawRawLab(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawJpegImage(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
+    procedure DrawJp2Image(Bitmap: TBitmap; const R: TRect; E: TPdfImageElement);
     procedure DrawPathElement(Bitmap: TBitmap; Page: TPdfPage; E: TPdfPathElement);
     function DrawPathGdiPlus(Bitmap: TBitmap; Page: TPdfPage; E: TPdfPathElement): Boolean;
     function BuildClipCoverage(Mask: TBitmap; Page: TPdfPage; E: TPdfPageElement; OffX, OffY: Integer): Boolean;
@@ -83,6 +85,18 @@ type
   end;
 
 implementation
+
+// True if Data is a JPEG 2000 codestream: either the JP2 box signature
+// (00 00 00 0C 6A 50 20 20 ...) or a raw JPC codestream (FF 4F FF 51 ...).
+function IsJpeg2000(const Data: TPdfBytes): Boolean;
+begin
+  Result :=
+    ((Length(Data) >= 8) and (Data[4] = $6A) and (Data[5] = $50) and
+     (Data[6] = $20) and (Data[7] = $20))
+    or
+    ((Length(Data) >= 4) and (Data[0] = $FF) and (Data[1] = $4F) and
+     (Data[2] = $FF) and (Data[3] = $51));
+end;
 
 // GDI font-from-memory API — declared without the Windows unit to avoid its
 // TBitmap/Rect redefinitions conflicting with Graphics.TBitmap.
@@ -1717,6 +1731,36 @@ begin
   MS.Free;
 end;
 
+// Decode a JPEG 2000 (JPXDecode) image with the Jp2ImageX library and blit it.
+// The library reads the dimensions and colour from the JP2/JPC codestream itself.
+procedure TPdfBitmapRenderer.DrawJp2Image(Bitmap: TBitmap; const R: TRect;
+  E: TPdfImageElement);
+var
+  Jp2: TJp2Image;
+  MS: TMemoryStream;
+  Ok: Boolean;
+begin
+  if Length(E.Data) = 0 then Exit;
+  Jp2 := TJp2Image.Create;
+  MS  := TMemoryStream.Create;
+  try
+    MS.WriteBuffer(E.Data[0], Length(E.Data));
+    MS.Position := 0;
+    Ok := False;
+    try
+      Jp2.LoadFromStream(MS);
+      Ok := (Jp2.Width > 0) and (Jp2.Height > 0);
+    except
+      Ok := False;
+    end;
+    if Ok then DrawBitmapScaled(Bitmap, R, Jp2.ToBitmap)
+    else DrawPlaceholder(Bitmap, R, E.Name);
+  finally
+    MS.Free;
+    Jp2.Free;
+  end;
+end;
+
 procedure TPdfBitmapRenderer.DrawImageElement(Bitmap: TBitmap; Page: TPdfPage;
   E: TPdfImageElement);
 var
@@ -1750,6 +1794,13 @@ begin
   if (Length(E.Data) >= 2) and (E.Data[0] = $FF) and (E.Data[1] = $D8) then
   begin
     DrawJpegImage(Bitmap, R, E);
+    Exit;
+  end;
+
+  // JPEG 2000 (JPXDecode), also passed through undecoded by the filter engine.
+  if IsJpeg2000(E.Data) then
+  begin
+    DrawJp2Image(Bitmap, R, E);
     Exit;
   end;
 
