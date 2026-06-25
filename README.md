@@ -134,13 +134,11 @@ Images:
 - Soft-mask transparency
 - Lab color-space images
 - JPEG 2000 / JPXDecode
-    
+- JBIG2 images (monochrome)
 Embedded font formats:
 - TrueType — FontFile2
 - CFF / Type1C / CIDFontType0C / OpenType — FontFile3
 
 ## PDF Features NOT supported
 
-Images:
-- JBIG2 images (monochrome)
-
+?
