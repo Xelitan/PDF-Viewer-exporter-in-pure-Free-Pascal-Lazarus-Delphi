@@ -373,6 +373,9 @@ type
     // CCITTFaxDecode: if the image stream uses it, decode the fax bits to 8-bit
     // DeviceGray so the normal raster pipeline can render/export the image.
     procedure ApplyCcittDecode(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
+    // JBIG2Decode: if the image stream uses it, decode the JBIG2 codestream (plus
+    // the optional /JBIG2Globals stream) to 8-bit DeviceGray, same as CCITT.
+    procedure ApplyJBIG2Decode(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
     // Decode the image's /SMask (a DeviceGray image) into ImgE.Alpha, scaled to the
     // base image's dimensions. Gives per-pixel transparency (PNG alpha).
     procedure ApplyImageSMask(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
@@ -440,7 +443,7 @@ function PdfDecodeLabToRGB(const Data: TPdfBytes; W, H, Bpc: Integer;
 
 implementation
 
-uses PdfCFF, PdfBitmapRenderer, PdfJpeg, PdfCcitt, FPImage, FPWriteJPEG;  // added-API helpers
+uses PdfCFF, PdfBitmapRenderer, PdfJpeg, PdfCcitt, JBig2ImageX, FPImage, FPWriteJPEG;  // added-API helpers
 
 function PdfDecodeLabToRGB(const Data: TPdfBytes; W, H, Bpc: Integer;
   const Range: array of Double; Xw, Yw, Zw: Double; out RGB: TPdfBytes): Boolean;
@@ -1807,6 +1810,90 @@ begin
       Invert := not Invert;
 
   if not DecodeCCITTFax(ImgE.Data, K, Cols, Rws, ByteAlign, OutW, OutH, Gray) then Exit;
+  if Invert then
+    for I := 0 to High(Gray) do Gray[I] := 255 - Gray[I];
+
+  ImgE.Data := Gray;
+  ImgE.ColorSpace := 'DeviceGray';
+  ImgE.BitsPerComponent := 8;
+  if ImgE.Width <= 0 then ImgE.Width := OutW;
+  if ImgE.Height <= 0 then ImgE.Height := OutH;
+end;
+
+// JBIG2Decode is an image-only filter that DecodeStream passes through raw (like
+// CCITTFaxDecode/DCTDecode). When an image XObject uses it, decode the JBIG2
+// codestream here -- pulling the optional shared /JBIG2Globals stream from the
+// DecodeParms -- and turn the element into a plain 8-bit DeviceGray raster, so
+// DrawRawDeviceGray and the ExportImage path handle it with no special-casing.
+procedure TPdfDocument.ApplyJBIG2Decode(Stm: TPdfStreamObject; ImgE: TPdfImageElement);
+var
+  FO, PO, X, PItem, DObj, GObj: TPdfObject;
+  Parms: TPdfDictionaryObject;
+  I, OutW, OutH: Integer;
+  IsJbig2, Invert: Boolean;
+  Globals, Gray: TPdfBytes;
+
+  function IsJbig2Name(const N: string): Boolean;
+  begin
+    Result := SameText(N, 'JBIG2Decode');
+  end;
+
+begin
+  if (ImgE = nil) or (Length(ImgE.Data) = 0) then Exit;
+  IsJbig2 := False;
+  Parms := nil;
+  FO := ResolveObject(Stm.Get('Filter'));
+  if not Assigned(FO) then Exit;
+  PO := ResolveObject(Stm.Get('DecodeParms'));
+  if not Assigned(PO) then PO := ResolveObject(Stm.Get('DP'));
+
+  if (FO.Kind = pokName) and IsJbig2Name(FO.AsName) then
+  begin
+    IsJbig2 := True;
+    if PO is TPdfDictionaryObject then Parms := TPdfDictionaryObject(PO);
+  end
+  else if FO is TPdfArrayObject then
+    // JBIG2 may follow a transport filter (e.g. ASCII85); those were already
+    // undone by DecodeStream, so ImgE.Data holds the raw JBIG2 codestream.
+    for I := 0 to TPdfArrayObject(FO).Items.Count - 1 do
+    begin
+      X := ResolveObject(TPdfObject(TPdfArrayObject(FO).Items[I]));
+      if Assigned(X) and (X.Kind = pokName) and IsJbig2Name(X.AsName) then
+      begin
+        IsJbig2 := True;
+        if (PO is TPdfArrayObject) and (I < TPdfArrayObject(PO).Items.Count) then
+        begin
+          PItem := ResolveObject(TPdfObject(TPdfArrayObject(PO).Items[I]));
+          if PItem is TPdfDictionaryObject then Parms := TPdfDictionaryObject(PItem);
+        end
+        else if PO is TPdfDictionaryObject then
+          Parms := TPdfDictionaryObject(PO);
+        Break;
+      end;
+    end;
+  if not IsJbig2 then Exit;
+
+  // /JBIG2Globals (a stream) holds segments shared across images. Decode it
+  // through the filter pipeline in case it is itself Flate/ASCII-encoded.
+  Globals := nil;
+  if Assigned(Parms) then
+  begin
+    GObj := ResolveObject(Parms.Get('JBIG2Globals'));
+    if GObj is TPdfStreamObject then
+      Globals := DecodeStream(TPdfStreamObject(GObj));
+  end;
+
+  // Decoder emits 0 = black, 255 = white -- the displayed luminance directly,
+  // matching the default 1-bit DeviceGray /Decode [0 1].
+  if not DecodeJBig2ToGray(ImgE.Data, Globals, OutW, OutH, Gray) then Exit;
+
+  // /Decode [1 0] inverts the samples.
+  Invert := False;
+  DObj := ResolveObject(Stm.Get('Decode'));
+  if (DObj is TPdfArrayObject) and (TPdfArrayObject(DObj).Items.Count >= 2) then
+    if TPdfObject(TPdfArrayObject(DObj).Items[0]).AsNumber >
+       TPdfObject(TPdfArrayObject(DObj).Items[1]).AsNumber then
+      Invert := True;
   if Invert then
     for I := 0 to High(Gray) do Gray[I] := 255 - Gray[I];
 
@@ -4084,6 +4171,8 @@ begin
                     // CCITT fax images: decode to 8-bit DeviceGray right here so
                     // the element renders through the normal raster path.
                     ApplyCcittDecode(TPdfStreamObject(O3), ImgE);
+                    // JBIG2 images: likewise decode to 8-bit DeviceGray.
+                    ApplyJBIG2Decode(TPdfStreamObject(O3), ImgE);
                     // /SMask -> per-pixel alpha (PNG transparency).
                     ApplyImageSMask(TPdfStreamObject(O3), ImgE);
                     SetElemClip(ImgE);
