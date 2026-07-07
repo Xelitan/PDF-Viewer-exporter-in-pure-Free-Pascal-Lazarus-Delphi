@@ -36,7 +36,9 @@ function DecodeJBIG2Packed(const Data, Globals: TBytes; out OutW, OutH: Integer;
   out Bits: TBytes): Boolean;
 
 // Diagnostic message set when DecodeJBIG2/DecodeJBIG2Packed returns False.
-var
+// Threadvar so concurrent decodes each report their own error (and don't race
+// on the string's reference count).
+threadvar
   LastJBIG2Error: string;
 
 implementation
@@ -68,8 +70,15 @@ type
     constructor Create;
   end;
 
-var
-  GArena: TList = nil;
+// Object arena for one decode run. It is a THREADVAR, not a plain global: each
+// thread gets its own copy, so several .jb2 files can be decoded concurrently
+// (e.g. by a multi-threaded thumbnailer) without racing on or freeing each
+// other's arena. A single decode runs entirely on one thread, so per-thread
+// isolation is all that's required - no locking. The cached Huffman/MMR tables
+// (GStandardTables, GWhiteTable, GBlackTable, GModeTable) and LastJBIG2Error are
+// threadvars for the same reason.
+threadvar
+  GArena: TList;
 
 constructor TJBObject.Create;
 begin
@@ -932,7 +941,9 @@ const
   STD_B14: array[0..4] of TStdLine = ((3,0,-2,0),(3,0,-1,0),(1,0,0,0),(3,0,1,0),(3,0,2,0));
   STD_B15: array[0..12] of TStdLine = ((7,4,-24,0),(6,2,-8,0),(5,1,-4,0),(4,0,-2,0),(3,0,-1,0),(1,0,0,0),(3,0,1,0),(4,0,2,0),(5,1,3,0),(6,2,5,0),(7,4,9,0),(7,32,-25,STD_LOWER),(7,32,25,0));
 
-var
+// Per-thread cache of the standard Huffman tables (see GArena). Cleared and
+// rebuilt at the start of every decode, freed via the arena at its end.
+threadvar
   GStandardTables: array[1..15] of TJBHuffmanTable;
 
 function BuildStandardTable(const lines: array of TStdLine): TJBHuffmanTable;
@@ -1902,9 +1913,12 @@ var
 begin
   Result := False;
   OutW := 0; OutH := 0; Bits := nil;
+  // GArena and the cached tables are threadvars, so this whole run works on
+  // per-thread state - concurrent decodes on other threads don't interfere and
+  // no lock is needed.
   GArena := TList.Create;
-  // Cached tables live in the arena and are freed below; clear the globals so
-  // they are rebuilt fresh inside this run's arena.
+  // Cached tables live in the arena and are freed below; clear the (per-thread)
+  // globals so they are rebuilt fresh inside this run's arena.
   FillChar(GStandardTables, SizeOf(GStandardTables), 0);
   GWhiteTable := nil; GBlackTable := nil; GModeTable := nil;
   try
@@ -1963,6 +1977,6 @@ begin
     end;
 end;
 
-initialization
-  FillChar(GStandardTables, SizeOf(GStandardTables), 0);
+// No initialization needed: GArena and the table caches are threadvars, zeroed
+// per thread and (re)built inside each decode run.
 end.
